@@ -77,6 +77,8 @@ final class AuthViewModel {
     var signUpPassword: String = ""
     var signUpConfirmPassword: String = ""
     var isSigningUp: Bool = false
+    /// When true, the user's password is saved to Keychain for auto-relogin on 401.
+    var rememberPassword: Bool = false
 
     /// Backend config fetched after server verification.
     var backendConfig: BackendConfig?
@@ -462,6 +464,12 @@ final class AuthViewModel {
                 isLoggingIn = false
                 return
             }
+            // Save password to Keychain if "Remember password" is checked
+            if rememberPassword {
+                guard let server = serverConfigStore.activeServer else {}
+                KeychainService.shared.savePassword(password, email: email, forServer: server.url)
+                logger.info("💾 Saved password to Keychain for '\(self.email)' on '\(server.url)'")
+            }
             // SECURITY FIX: Clear password from memory immediately after successful auth
             password = ""
             // Clear cached chat VMs so models are re-fetched for the new account
@@ -586,6 +594,12 @@ final class AuthViewModel {
                 username: ldapUsername,
                 password: ldapPassword
             )
+            // Save password to Keychain if "Remember password" is checked
+            if rememberPassword {
+                guard let server = serverConfigStore.activeServer else {}
+                KeychainService.shared.savePassword(ldapPassword, email: ldapUsername, forServer: server.url)
+                logger.info("💾 Saved LDAP password to Keychain for '\(self.ldapUsername)' on '\(server.url)'")
+            }
             // SECURITY FIX: Clear LDAP password from memory immediately after successful auth
             ldapPassword = ""
             // Clear cached chat VMs so models are re-fetched for the new account
@@ -686,6 +700,11 @@ final class AuthViewModel {
 
                 // If the token is genuinely invalid (401/403), don't retry
                 if apiError.requiresReauth {
+                    // Try auto-relogin with saved password first
+                    if await autoReloginWithSavedPassword() {
+                        logger.info("✅ Auto-relogin succeeded during session restore")
+                        return
+                    }
                     logger.warning("Session restore: token invalid (401), clearing credentials")
                     client.updateAuthToken(nil)
                     currentUser = nil
@@ -759,6 +778,17 @@ final class AuthViewModel {
         // restore a signed-out user.
         clearCachedUser()
 
+        // Delete any saved password for this server
+        if let server = serverConfigStore.activeServer {
+            if !email.isEmpty {
+                KeychainService.shared.deletePassword(email: email, forServer: server.url)
+            }
+            if !ldapUsername.isEmpty {
+                KeychainService.shared.deletePassword(email: ldapUsername, forServer: server.url)
+            }
+            rememberPassword = false
+        }
+
         // SECURITY FIX: Clear SSO/OAuth cookies so the next user can't
         // auto-authenticate with the previous user's SSO session.
         clearSSOCookies()
@@ -830,6 +860,11 @@ final class AuthViewModel {
         } catch {
             let apiError = APIError.from(error)
             if apiError.requiresReauth {
+                // Try auto-relogin with saved password before kicking to login screen
+                if await autoReloginWithSavedPassword() {
+                    logger.info("✅ Auto-relogin succeeded during token refresh")
+                    return
+                }
                 logger.warning("Token expired during refresh; user must re-authenticate")
                 await MainActor.run {
                     self.currentUser = nil
@@ -840,12 +875,94 @@ final class AuthViewModel {
         }
     }
 
+    /// Attempts to re-login using a saved password from Keychain.
+    /// Returns true if auto-relogin succeeds, false otherwise.
+    /// Checks for saved passwords for both the known email and ldapUsername.
+    func autoReloginWithSavedPassword() async -> Bool {
+        guard let client = dependencies?.apiClient,
+              let server = serverConfigStore.activeServer else { return false }
+
+        // Try to find a saved password. Check the cached user email first,
+        // then try the ldapUsername if available.
+        let emailsToTry: [String] = {
+            var candidates: [String] = []
+            // The cached user email (from previous session)
+            if let user = AuthViewModel.loadCachedUser(forServer: server.url) {
+                candidates.append(user.email)
+            }
+            // Also try the current email field if non-empty
+            if !email.isEmpty {
+                candidates.append(email)
+            }
+            // Also try ldapUsername
+            if !ldapUsername.isEmpty {
+                candidates.append(ldapUsername)
+            }
+            return candidates
+        }()
+
+        for candidateEmail in emailsToTry where !candidateEmail.isEmpty {
+            guard let savedPassword = KeychainService.shared.getPassword(email: candidateEmail, forServer: server.url) else {
+                continue
+            }
+
+            logger.info("🔑 Attempting auto-relogin with saved password for '\(candidateEmail)'")
+
+            do {
+                let user = try await client.login(email: candidateEmail, password: savedPassword)
+                currentUser = user
+                cacheCurrentUser()
+                saveCurrentUserAsAccount(authType: .credentials)
+                connectSocketWithToken()
+                backendConfig = try? await client.getBackendConfig()
+                await MainActor.run {
+                    self.phase = .authenticated
+                    self.startTokenRefreshTimer()
+                }
+                logger.info("✅ Auto-relogin successful for '\(candidateEmail)'")
+                return true
+            } catch {
+                logger.warning("Auto-relogin failed for '\(candidateEmail)': \(error.localizedDescription)")
+                // Don't try other emails if this one had a password — likely the right account but wrong creds
+                break
+            }
+        }
+
+        return false
+    }
+
     // MARK: - Navigation Helpers
 
     /// Navigates to a specific auth phase.
     func goToPhase(_ newPhase: AuthPhase) {
         errorMessage = nil
         phase = newPhase
+
+        // When navigating to a login screen, check if password is already saved
+        // and pre-check the "Remember password" toggle
+        if newPhase == .credentialLogin || newPhase == .ldapLogin {
+            if let server = serverConfigStore.activeServer {
+                let emailsToCheck: [String] = {
+                    var candidates: [String] = []
+                    if let cached = AuthViewModel.loadCachedUser(forServer: server.url) {
+                        candidates.append(cached.email)
+                    }
+                    if !email.isEmpty {
+                        candidates.append(email)
+                    }
+                    if !ldapUsername.isEmpty {
+                        candidates.append(ldapUsername)
+                    }
+                    return candidates
+                }()
+                for candidate in emailsToCheck where !candidate.isEmpty {
+                    if KeychainService.shared.hasPassword(email: candidate, forServer: server.url) {
+                        rememberPassword = true
+                        break
+                    }
+                }
+            }
+        }
     }
 
     /// Goes back from the current phase.
@@ -1626,6 +1743,11 @@ final class AuthViewModel {
             let apiError = APIError.from(error)
 
             if apiError.requiresReauth {
+                // Try auto-relogin with saved password first
+                if await autoReloginWithSavedPassword() {
+                    logger.info("✅ Auto-relogin succeeded during background validation")
+                    return
+                }
                 // Token is truly dead — kick to login
                 logger.warning("⚠️ Background validation: token invalid, signing out")
                 client.updateAuthToken(nil)

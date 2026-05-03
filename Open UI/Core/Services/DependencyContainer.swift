@@ -356,6 +356,11 @@ final class AppDependencyContainer: ServiceContainer {
         // Set up 401 callback for automatic re-auth
         apiClient?.onAuthTokenInvalid = { [weak self] in
             Task { @MainActor in
+                // Try auto-relogin with saved password before showing login screen
+                if await self?.authViewModel.autoReloginWithSavedPassword() == true {
+                    self?.authViewModel.startTokenRefreshTimer()
+                    return
+                }
                 self?.authViewModel.currentUser = nil
                 self?.authViewModel.phase = .authMethodSelection
                 self?.authViewModel.errorMessage = "Your session has expired. Please sign in again."

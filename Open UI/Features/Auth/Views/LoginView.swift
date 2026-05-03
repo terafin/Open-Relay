@@ -138,6 +138,13 @@ struct LoginView: View {
                         }
                     }
 
+                    // Remember password toggle
+                    Toggle("Remember password", isOn: $viewModel.rememberPassword)
+                        .scaledFont(size: 14)
+                        .foregroundStyle(theme.textSecondary)
+                        .toggleStyle(.switch)
+                        .padding(.top, Spacing.xs)
+
                     // Sign up link (when enabled)
                     if viewModel.isSignupEnabled {
                         HStack(spacing: Spacing.xs) {
@@ -263,6 +270,13 @@ struct LDAPLoginView: View {
                             }
                         }
                     }
+
+                    // Remember password toggle
+                    Toggle("Remember password", isOn: $viewModel.rememberPassword)
+                        .scaledFont(size: 14)
+                        .foregroundStyle(theme.textSecondary)
+                        .toggleStyle(.switch)
+                        .padding(.top, Spacing.xs)
                 }
                 .padding(Spacing.lg)
                 .background(

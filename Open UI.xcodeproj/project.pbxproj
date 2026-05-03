@@ -11,15 +11,11 @@
 		3852C7112F71110800283682 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3852C7102F71110800283682 /* SwiftUI.framework */; };
 		3852C7222F71110900283682 /* OpenUIWidgetsExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 3852C70C2F71110800283682 /* OpenUIWidgetsExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		38754A972F845BE60012CD28 /* ReactionContextMenu in Frameworks */ = {isa = PBXBuildFile; productRef = 38754A962F845BE60012CD28 /* ReactionContextMenu */; };
-		387CA40E2F882523000B5152 /* MarkdownParser in Frameworks */ = {isa = PBXBuildFile; productRef = 387CA40D2F882523000B5152 /* MarkdownParser */; };
 		387CA4102F882523000B5152 /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = 387CA40F2F882523000B5152 /* MarkdownView */; };
-		387CAAD62F8AB953000B5152 /* MarkdownParser in Frameworks */ = {isa = PBXBuildFile; productRef = 387CAAD52F8AB953000B5152 /* MarkdownParser */; };
 		387CAAD82F8AB953000B5152 /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = 387CAAD72F8AB953000B5152 /* MarkdownView */; };
-		3890E28F2F9845C10011D505 /* MarkdownParser in Frameworks */ = {isa = PBXBuildFile; productRef = 3890E28E2F9845C10011D505 /* MarkdownParser */; };
 		3890E2912F9845C10011D505 /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = 3890E2902F9845C10011D505 /* MarkdownView */; };
 		38AA00012FA9B00000MRMAID /* BeautifulMermaid in Frameworks */ = {isa = PBXBuildFile; productRef = 38AA00002FA9B00000MRMAID /* BeautifulMermaid */; };
 		38AA00042FA9B00000SVGDRW /* SwiftDraw in Frameworks */ = {isa = PBXBuildFile; productRef = 38AA00032FA9B00000SVGDRW /* SwiftDraw */; };
-		38B6DED52FA55DDC001924FB /* MarkdownParser in Frameworks */ = {isa = PBXBuildFile; productRef = 38B6DED42FA55DDC001924FB /* MarkdownParser */; };
 		38B6DED72FA55DDC001924FB /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = 38B6DED62FA55DDC001924FB /* MarkdownView */; };
 		38FEA3182FA2A18600A98F25 /* MLXAudioCore in Frameworks */ = {isa = PBXBuildFile; productRef = 38FEA3172FA2A18600A98F25 /* MLXAudioCore */; };
 		38FEA31A2FA2A18600A98F25 /* MLXAudioSTT in Frameworks */ = {isa = PBXBuildFile; productRef = 38FEA3192FA2A18600A98F25 /* MLXAudioSTT */; };
@@ -112,13 +108,9 @@
 				38754A972F845BE60012CD28 /* ReactionContextMenu in Frameworks */,
 				387CAAD82F8AB953000B5152 /* MarkdownView in Frameworks */,
 				38B6DED72FA55DDC001924FB /* MarkdownView in Frameworks */,
-				3890E28F2F9845C10011D505 /* MarkdownParser in Frameworks */,
 				387CA4102F882523000B5152 /* MarkdownView in Frameworks */,
-				38B6DED52FA55DDC001924FB /* MarkdownParser in Frameworks */,
-				387CAAD62F8AB953000B5152 /* MarkdownParser in Frameworks */,
 				3890E2912F9845C10011D505 /* MarkdownView in Frameworks */,
 				38AA00012FA9B00000MRMAID /* BeautifulMermaid in Frameworks */,
-				387CA40E2F882523000B5152 /* MarkdownParser in Frameworks */,
 				38AA00042FA9B00000SVGDRW /* SwiftDraw in Frameworks */,
 				38FEA31A2FA2A18600A98F25 /* MLXAudioSTT in Frameworks */,
 			);
@@ -202,16 +194,12 @@
 				38AA00002FA9B00000MRMAID /* BeautifulMermaid */,
 				38AA00032FA9B00000SVGDRW /* SwiftDraw */,
 				38754A962F845BE60012CD28 /* ReactionContextMenu */,
-				387CA40D2F882523000B5152 /* MarkdownParser */,
 				387CA40F2F882523000B5152 /* MarkdownView */,
-				387CAAD52F8AB953000B5152 /* MarkdownParser */,
 				387CAAD72F8AB953000B5152 /* MarkdownView */,
-				3890E28E2F9845C10011D505 /* MarkdownParser */,
 				3890E2902F9845C10011D505 /* MarkdownView */,
 				38FEA3172FA2A18600A98F25 /* MLXAudioCore */,
 				38FEA3192FA2A18600A98F25 /* MLXAudioSTT */,
 				38FEA31B2FA2A18600A98F25 /* MLXAudioTTS */,
-				38B6DED42FA55DDC001924FB /* MarkdownParser */,
 				38B6DED62FA55DDC001924FB /* MarkdownView */,
 			);
 			productName = "Open UI";
@@ -628,10 +616,6 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		38B6DED32FA55DDC001924FB /* XCLocalSwiftPackageReference "../MarkdownView" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = ../MarkdownView;
-		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -667,6 +651,14 @@
 				kind = branch;
 			};
 		};
+		38B6DED32FA55DDC001924FB /* XCRemoteSwiftPackageReference "MarkdownView" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/LiYanan2004/MarkdownView";
+			requirement = {
+				branch = main;
+				kind = branch;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -675,28 +667,19 @@
 			package = 38754A952F845BE60012CD28 /* XCRemoteSwiftPackageReference "ReactionContextMenu" */;
 			productName = ReactionContextMenu;
 		};
-		387CA40D2F882523000B5152 /* MarkdownParser */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = MarkdownParser;
-		};
 		387CA40F2F882523000B5152 /* MarkdownView */ = {
 			isa = XCSwiftPackageProductDependency;
+			package = 38B6DED32FA55DDC001924FB /* XCRemoteSwiftPackageReference "MarkdownView" */;
 			productName = MarkdownView;
-		};
-		387CAAD52F8AB953000B5152 /* MarkdownParser */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = MarkdownParser;
 		};
 		387CAAD72F8AB953000B5152 /* MarkdownView */ = {
 			isa = XCSwiftPackageProductDependency;
+			package = 38B6DED32FA55DDC001924FB /* XCRemoteSwiftPackageReference "MarkdownView" */;
 			productName = MarkdownView;
-		};
-		3890E28E2F9845C10011D505 /* MarkdownParser */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = MarkdownParser;
 		};
 		3890E2902F9845C10011D505 /* MarkdownView */ = {
 			isa = XCSwiftPackageProductDependency;
+			package = 38B6DED32FA55DDC001924FB /* XCRemoteSwiftPackageReference "MarkdownView" */;
 			productName = MarkdownView;
 		};
 		38AA00002FA9B00000MRMAID /* BeautifulMermaid */ = {
@@ -709,12 +692,9 @@
 			package = 38AA00052FA9B00000SVGDRW /* XCRemoteSwiftPackageReference "SwiftDraw" */;
 			productName = SwiftDraw;
 		};
-		38B6DED42FA55DDC001924FB /* MarkdownParser */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = MarkdownParser;
-		};
 		38B6DED62FA55DDC001924FB /* MarkdownView */ = {
 			isa = XCSwiftPackageProductDependency;
+			package = 38B6DED32FA55DDC001924FB /* XCRemoteSwiftPackageReference "MarkdownView" */;
 			productName = MarkdownView;
 		};
 		38FEA3172FA2A18600A98F25 /* MLXAudioCore */ = {
