@@ -31,6 +31,21 @@ struct HistoryNode: Sendable {
     var embeds: [String]
     /// For user messages: the model IDs that were selected when this message was sent.
     var models: [String]
+    /// Feedback annotation for this message (thumbs up/down + detail ratings).
+    var annotation: MessageAnnotation?
+    /// Server-assigned feedback record ID.
+    var feedbackId: String?
+    /// True when meta.internal == true on this node (e.g. background sub-agent completion).
+    var isInternalMessage: Bool
+    /// Delegation ID from meta.delegation_id (background sub-agent completion notices).
+    var subagentDelegationId: String?
+    /// Raw `output` array from the server. Stored as-is and re-emitted
+    /// verbatim on every sync so the server's canonical format is never corrupted.
+    /// Content is reconstructed from this array during parsing but the original
+    /// array must survive the round-trip so that `files`, `images`, and other
+    /// server-derived metadata (e.g. from `function_call_output`) are preserved
+    /// even when the node is on an inactive branch.
+    var output: [[String: Any]]
 
     init(
         id: String = UUID().uuidString,
@@ -48,7 +63,12 @@ struct HistoryNode: Sendable {
         error: ChatMessageError? = nil,
         usage: [String: Any]? = nil,
         embeds: [String] = [],
-        models: [String] = []
+        models: [String] = [],
+        annotation: MessageAnnotation? = nil,
+        feedbackId: String? = nil,
+        isInternalMessage: Bool = false,
+        subagentDelegationId: String? = nil,
+        output: [[String: Any]] = []
     ) {
         self.id = id
         self.parentId = parentId
@@ -66,6 +86,11 @@ struct HistoryNode: Sendable {
         self.usage = usage
         self.embeds = embeds
         self.models = models
+        self.annotation = annotation
+        self.feedbackId = feedbackId
+        self.isInternalMessage = isInternalMessage
+        self.subagentDelegationId = subagentDelegationId
+        self.output = output
     }
 
     // MARK: - Serialization
@@ -137,6 +162,14 @@ struct HistoryNode: Sendable {
             dict["usage"] = usage
         }
 
+        if let annotation {
+            dict["annotation"] = annotation.toDict()
+        }
+
+        if let feedbackId {
+            dict["feedbackId"] = feedbackId
+        }
+
         if !statusHistory.isEmpty {
             let statusArray: [[String: Any]] = statusHistory.map { status in
                 var d: [String: Any] = [:]
@@ -160,6 +193,14 @@ struct HistoryNode: Sendable {
                 return d
             }
             dict["statusHistory"] = statusArray
+        }
+
+        // Re-emit the raw output array verbatim so the server's format is
+        // preserved across every sync. Without this, the server loses the `output`
+        // array and falls back to `content` only — which strips `files` and breaks
+        // image rendering when switching between regenerated versions.
+        if !output.isEmpty {
+            dict["output"] = output
         }
 
         return dict
@@ -249,6 +290,7 @@ struct MessageHistory: Sendable {
                 content: node.content,
                 timestamp: node.timestamp,
                 model: node.model,
+                isStreaming: !node.done,
                 files: node.files,
                 sources: node.sources,
                 statusHistory: node.statusHistory,
@@ -256,7 +298,11 @@ struct MessageHistory: Sendable {
                 error: node.error,
                 versions: versions,
                 usage: node.usage,
-                embeds: node.embeds
+                embeds: node.embeds,
+                annotation: node.annotation,
+                feedbackId: node.feedbackId,
+                isInternalMessage: node.isInternalMessage,
+                subagentDelegationId: node.subagentDelegationId
             )
         }
     }
@@ -383,14 +429,14 @@ struct MessageHistory: Sendable {
         return history
     }
 
-    // MARK: - v0.7 Output Array Reconstruction
+    // MARK: - Output Array Reconstruction
 
-    /// Reconstructs a legacy-style content string from Open WebUI v0.7's structured
+    /// Reconstructs a content string from the server's structured
     /// `output` array, producing inline `<details type="tool_calls">` and
     /// `<details type="reasoning">` blocks that the existing `ToolCallParser`
     /// can render without modification.
     ///
-    /// Output array structure (v0.7+):
+    /// Output array structure:
     /// ```
     /// [
     ///   { type: "message", content: [{type: "output_text", text: "..."}] },
@@ -401,12 +447,22 @@ struct MessageHistory: Sendable {
     /// ```
     ///
     /// Returns `nil` if the output array is empty or has no usable content.
+    ///
     static func reconstructContentFromOutput(_ outputArr: [[String: Any]]) -> String? {
-        // First pass: build a map of call_id → result text from function_call_output items
-        var outputByCallId: [String: String] = [:]
+        // ── Pass 1: build lookup maps from function_call_output items ──────────
+        //
+        // Index by BOTH call_id AND item id so we handle mismatches between
+        // what the server puts in function_call.call_id vs function_call_output.call_id
+        // (some providers use the call's `id` field as the output's `call_id`).
+        var outputByCallId: [String: String] = [:]   // keyed by call_id
+        var outputById:     [String: String] = [:]   // keyed by id (fallback)
+        var embedsByCallId: [String: [String]] = [:]
+
         for item in outputArr {
-            guard (item["type"] as? String) == "function_call_output",
-                  let callId = item["call_id"] as? String else { continue }
+            guard (item["type"] as? String) == "function_call_output" else { continue }
+            let callId = item["call_id"] as? String ?? ""
+            let itemId = item["id"]      as? String ?? ""
+
             // Extract result text from output[].text
             if let outputItems = item["output"] as? [[String: Any]] {
                 let texts = outputItems.compactMap { o -> String? in
@@ -414,19 +470,28 @@ struct MessageHistory: Sendable {
                     return text
                 }
                 if !texts.isEmpty {
-                    outputByCallId[callId] = texts.joined(separator: "\n")
+                    let combined = texts.joined(separator: "\n")
+                    if !callId.isEmpty { outputByCallId[callId] = combined }
+                    if !itemId.isEmpty { outputById[itemId]     = combined }
+                }
+            }
+
+            // Rich-UI HTML embeds stored on the output item
+            if let embeds = item["embeds"] as? [String] {
+                let filtered = embeds.filter { !$0.isEmpty && !$0.contains("data-iv-build") }
+                if !filtered.isEmpty, !callId.isEmpty {
+                    embedsByCallId[callId] = filtered
                 }
             }
         }
 
-        // Second pass: build content string in order
+        // ── Pass 2: build content string in output-array order ────────────────
         var parts: [String] = []
         for item in outputArr {
             guard let type = item["type"] as? String else { continue }
 
             switch type {
             case "message":
-                // Plain text or final answer
                 guard let contentArr = item["content"] as? [[String: Any]] else { continue }
                 let textParts = contentArr.compactMap { piece -> String? in
                     guard (piece["type"] as? String) == "output_text",
@@ -434,38 +499,75 @@ struct MessageHistory: Sendable {
                     return text
                 }
                 let text = textParts.joined()
-                if !text.isEmpty {
-                    parts.append(text)
-                }
+                if !text.isEmpty { parts.append(text) }
 
             case "function_call":
-                // Tool call → reconstruct <details type="tool_calls"> block
                 guard let name = item["name"] as? String, !name.isEmpty else { continue }
-                let callId = item["call_id"] as? String ?? item["id"] as? String ?? ""
-                let itemId = item["id"] as? String ?? callId
-                let status = item["status"] as? String ?? "completed"
-                let isDone = (status == "completed")
+
+                let status = item["status"] as? String ?? ""
+
+                // Resolve IDs — some providers use `id` as the output's `call_id`
+                let callId = item["call_id"] as? String ?? ""
+                let itemId = item["id"]      as? String ?? callId
+                let effectiveCallId = callId.isEmpty ? itemId : callId
+
                 let arguments = item["arguments"] as? String ?? ""
 
-                // HTML-entity encode arguments for use as an attribute value
-                let encodedArgs = htmlEntityEncode(arguments)
-                // Retrieve the matching result
-                let resultText = outputByCallId[callId] ?? ""
-                let encodedResult = htmlEntityEncode(resultText)
+                // Look up result with dual-index fallback.
+                // IMPORTANT: resultText must be resolved BEFORE isDone so we can use
+                // its presence as the primary done signal (matching OpenWebUI exactly).
+                let resultText = outputByCallId[effectiveCallId]
+                    ?? outputByCallId[itemId]
+                    ?? outputById[effectiveCallId]
+                    ?? outputById[itemId]
+                    ?? ""
 
-                let doneAttr = isDone ? "true" : "false"
-                // Build the details block matching ToolCallParser expectations
-                // Result goes both as `result` attribute (fast path) and as body (fallback)
+                // A tool call is done when:
+                //   • the result has arrived (function_call_output exists in the array), OR
+                //   • it hit a terminal failure state (failed / incomplete / rejected)
+                //
+                // Critically: status="completed" means the CALL WAS DISPATCHED — the tool
+                // is now executing on the server (e.g. generating an image). It does NOT
+                // mean the result is ready. Only the presence of a function_call_output
+                // item (resultText non-empty) indicates the tool has truly finished.
+                //
+                // This matches OpenWebUI's structuredOutput.ts exactly:
+                //   const isDone = !!resultItem || status === 'failed' || status === 'incomplete';
+                //   const isExecuting = !isDone && status === 'completed';
+                let isDone = !resultText.isEmpty
+                          || status == "failed"
+                          || status == "incomplete"
+                          || status == "rejected"
+
+                let encodedArgs   = htmlEntityEncode(arguments)
+                let encodedResult = htmlEntityEncode(resultText)
+                let doneAttr      = isDone ? "true" : "false"
+                // Pass status through so the renderer can display pending/rejected states visually
+                let statusAttr    = " status=\"\(status)\""
+
+                // Build embeds attribute
+                let embedsAttr: String = {
+                    guard let embeds = embedsByCallId[effectiveCallId], !embeds.isEmpty else { return "" }
+                    guard let jsonData = try? JSONSerialization.data(withJSONObject: embeds),
+                          let jsonStr = String(data: jsonData, encoding: .utf8) else { return "" }
+                    let encoded = jsonStr
+                        .replacingOccurrences(of: "&", with: "&amp;")
+                        .replacingOccurrences(of: "\"", with: "&quot;")
+                        .replacingOccurrences(of: "<", with: "&lt;")
+                        .replacingOccurrences(of: ">", with: "&gt;")
+                    return " embeds=\"\(encoded)\""
+                }()
+
                 let block: String
                 if resultText.isEmpty {
                     block = """
-                    <details type="tool_calls" id="\(itemId)" name="\(name)" done="\(doneAttr)" arguments="\(encodedArgs)">
+                    <details type="tool_calls" id="\(itemId)" name="\(name)" done="\(doneAttr)"\(statusAttr) arguments="\(encodedArgs)"\(embedsAttr)>
                     <summary>Tool Executed</summary>
                     </details>
                     """
                 } else {
                     block = """
-                    <details type="tool_calls" id="\(itemId)" name="\(name)" done="\(doneAttr)" arguments="\(encodedArgs)" result="\(encodedResult)">
+                    <details type="tool_calls" id="\(itemId)" name="\(name)" done="\(doneAttr)"\(statusAttr) arguments="\(encodedArgs)" result="\(encodedResult)"\(embedsAttr)>
                     <summary>Tool Executed</summary>
                     \(resultText)
                     </details>
@@ -474,16 +576,27 @@ struct MessageHistory: Sendable {
                 parts.append(block)
 
             case "reasoning":
-                // Reasoning block (e.g. from Gemini) → <details type="reasoning">
+                // Map reasoning items to <details type="reasoning"> blocks.
+                // In-progress reasoning blocks (status != "completed") are emitted
+                // with done="false" so StreamingPipeline can freeze the drain cursor
+                // while they're still building — preventing partial HTML leaking to
+                // the renderer.
+                let status    = item["status"] as? String ?? "completed"
+                let isComplete = (status == "completed")
+
                 if let contentArr = item["content"] as? [[String: Any]] {
                     let reasoningText = contentArr.compactMap { piece -> String? in
                         guard (piece["type"] as? String) == "output_text",
                               let text = piece["text"] as? String, !text.isEmpty else { return nil }
                         return text
                     }.joined()
-                    if !reasoningText.isEmpty {
+                    // Emit even for in-progress blocks (done="false") so the pipeline
+                    // can detect the unclosed block and freeze — matches existing behaviour
+                    // for tool_calls blocks.
+                    if !reasoningText.isEmpty || !isComplete {
+                        let doneVal = isComplete ? "true" : "false"
                         let block = """
-                        <details type="reasoning" done="true">
+                        <details type="reasoning" done="\(doneVal)">
                         <summary>Thinking</summary>
                         \(reasoningText)
                         </details>
@@ -493,12 +606,87 @@ struct MessageHistory: Sendable {
                 }
 
             default:
-                break  // Skip function_call_output (already consumed above) and unknown types
+                break  // function_call_output consumed in pass 1; unknown types skipped
             }
         }
 
         guard !parts.isEmpty else { return nil }
         return parts.joined(separator: "\n\n")
+    }
+
+    // MARK: - Human-in-the-Loop: Pending Tool Action Scanning
+
+    /// A pending approval-required tool call found in a message's output array.
+    struct PendingToolCallInfo {
+        let messageId: String
+        let callId: String
+        let toolName: String
+        let arguments: String
+    }
+
+    /// A pending ask_user call found in a message's output array.
+    struct PendingAskUserInfo {
+        let messageId: String
+        let callId: String
+        let arguments: [String: Any]   // The parsed ask_user arguments dict
+    }
+
+    /// Scans a message's `output` array for the first tool call requiring approval
+    /// (`status == "pending"` or `status == "requires_approval"`, not `ask_user`).
+    static func findPendingApprovalCall(
+        messageId: String,
+        in outputArr: [[String: Any]]
+    ) -> PendingToolCallInfo? {
+        let resolvedIds: Set<String> = Set(outputArr.compactMap { item -> String? in
+            guard (item["type"] as? String) == "function_call_output",
+                  let cid = item["call_id"] as? String, !cid.isEmpty else { return nil }
+            return cid
+        })
+        for item in outputArr {
+            guard (item["type"] as? String) == "function_call",
+                  let name = item["name"] as? String, !name.isEmpty,
+                  name != "ask_user"
+            else { continue }
+            let st = item["status"] as? String ?? ""
+            guard st == "pending" || st == "requires_approval" else { continue }
+            let cid = item["call_id"] as? String ?? item["id"] as? String ?? ""
+            guard !cid.isEmpty, !resolvedIds.contains(cid) else { continue }
+            return PendingToolCallInfo(
+                messageId: messageId, callId: cid,
+                toolName: name, arguments: item["arguments"] as? String ?? "{}"
+            )
+        }
+        return nil
+    }
+
+    /// Scans a message's `output` array for a pending `ask_user` call.
+    static func findPendingAskUser(
+        messageId: String,
+        in outputArr: [[String: Any]]
+    ) -> PendingAskUserInfo? {
+        let resolvedIds: Set<String> = Set(outputArr.compactMap { item -> String? in
+            guard (item["type"] as? String) == "function_call_output",
+                  let cid = item["call_id"] as? String, !cid.isEmpty else { return nil }
+            return cid
+        })
+        for item in outputArr {
+            guard (item["type"] as? String) == "function_call",
+                  (item["name"] as? String) == "ask_user",
+                  (item["status"] as? String) == "pending"
+            else { continue }
+            let cid = item["call_id"] as? String ?? item["id"] as? String ?? ""
+            guard !cid.isEmpty, !resolvedIds.contains(cid) else { continue }
+            let rawArgs = item["arguments"] as? String ?? "{}"
+            let argsDict: [String: Any]
+            if let d = rawArgs.data(using: .utf8),
+               let p = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                argsDict = p
+            } else {
+                argsDict = [:]
+            }
+            return PendingAskUserInfo(messageId: messageId, callId: cid, arguments: argsDict)
+        }
+        return nil
     }
 
     /// HTML-entity encodes a string for safe use as an XML/HTML attribute value.
@@ -517,11 +705,17 @@ struct MessageHistory: Sendable {
         let roleStr = msg["role"] as? String ?? "user"
         let role = MessageRole(rawValue: roleStr) ?? .user
         var content = msg["content"] as? String ?? ""
-        // v0.7+: content is stored in a structured `output` array.
+        //: content is stored in a structured `output` array.
         // Reconstruct the full content string (with inline <details> blocks for
         // tool calls and reasoning) so the existing ToolCallParser renders everything
         // correctly: text, tool call cards, and reasoning blocks — all in order.
-        if content.isEmpty, let outputArr = msg["output"] as? [[String: Any]] {
+        //
+        // Always prefer the output array when present — even when `content` is non-empty.
+        // OpenWebUI 0.10+ stores only a compact tool-result summary blob in `content`
+        // (e.g. "📊 Presentazione pronta · 14 slide") while the full rich response
+        // (prose + tool call blocks + final answer) lives in the `output` array.
+        // Using `content` directly would show the stub instead of the real reply.
+        if let outputArr = msg["output"] as? [[String: Any]], !outputArr.isEmpty {
             if let reconstructed = reconstructContentFromOutput(outputArr) {
                 content = reconstructed
             }
@@ -660,6 +854,44 @@ struct MessageHistory: Sendable {
             }
         }
 
+        // Parse annotation
+        var annotation: MessageAnnotation?
+        if let rawAnnotation = msg["annotation"] as? [String: Any] {
+            var rating: Int?
+            if let r = rawAnnotation["rating"] as? Int { rating = r }
+            let tags = rawAnnotation["tags"] as? [String] ?? []
+            let reason = rawAnnotation["reason"] as? String
+            let comment = rawAnnotation["comment"] as? String
+            var detailRating: Int?
+            if let details = rawAnnotation["details"] as? [String: Any],
+               let dr = details["rating"] as? Int {
+                detailRating = dr
+            }
+            annotation = MessageAnnotation(
+                rating: rating, tags: tags, reason: reason,
+                comment: comment, detailRating: detailRating
+            )
+        }
+
+        // Parse feedbackId
+        let feedbackId = msg["feedbackId"] as? String
+
+        // Parse meta — used for internal sub-agent messages
+        // e.g. { "internal": true, "type": "subagent", "delegation_id": "deleg_..." }
+        var isInternalMessage = false
+        var subagentDelegationId: String?
+        if let metaDict = msg["meta"] as? [String: Any] {
+            isInternalMessage = metaDict["internal"] as? Bool ?? false
+            if isInternalMessage {
+                subagentDelegationId = metaDict["delegation_id"] as? String
+            }
+        }
+
+        // Preserve the raw output array so it can be re-emitted verbatim
+        // on every sync. This prevents the server's canonical format from being
+        // corrupted when the app re-serializes a node it loaded from the server.
+        let rawOutput = msg["output"] as? [[String: Any]] ?? []
+
         return HistoryNode(
             id: id,
             parentId: parentId,
@@ -676,7 +908,12 @@ struct MessageHistory: Sendable {
             error: error,
             usage: usage,
             embeds: embeds,
-            models: models
+            models: models,
+            annotation: annotation,
+            feedbackId: feedbackId,
+            isInternalMessage: isInternalMessage,
+            subagentDelegationId: subagentDelegationId,
+            output: rawOutput
         )
     }
 }

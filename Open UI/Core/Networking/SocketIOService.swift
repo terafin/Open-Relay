@@ -70,11 +70,34 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
     /// Engine.IO session ID received from the handshake.
     private(set) var sid: String?
 
+    /// Monotonically increasing counter, incremented on every `connect()` call.
+    /// All async callbacks capture this value and ignore results from older
+    /// connection generations, preventing stale disconnect/reconnect races.
+    private var connectionGeneration: Int = 0
+
     /// Whether the socket is currently connected.
     private(set) var isConnected = false
 
     /// Whether a connection attempt is in progress.
     private(set) var isConnecting = false
+
+    /// Whether `user-join` has been acknowledged by the server for the current
+    /// connection. The server only routes chat/channel events to sockets that
+    /// are in the `user:{id}` room, which `user-join` (or the auth-carrying
+    /// CONNECT handshake) is responsible for joining. Being `isConnected` is
+    /// NOT sufficient — there is a window between the Socket.IO CONNECT ack
+    /// and the `user-join` ack during which the socket exists but has not yet
+    /// joined the room, so events emitted in that window are silently dropped
+    /// by the server. Callers that need guaranteed event delivery (sending a
+    /// chat message) must wait for `isUserJoined` before proceeding.
+    private(set) var isUserJoined = false
+
+    /// Pending client-initiated ack callbacks, keyed by the ack ID we generated
+    /// when emitting. Invoked when the server responds with `43<id>[...]`.
+    private var pendingAcks: [Int: (Any?) -> Void] = [:]
+    private var nextAckId = 0
+    private let ackLock = OSAllocatedUnfairLock<Void>(initialState: ())
+
 
     /// Number of reconnections since creation.
     private(set) var reconnectCount = 0
@@ -174,6 +197,10 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
     func connect(force: Bool = false) {
         if isConnected && !force { return }
         if isConnecting && !force { return }
+
+        // Increment generation so any callbacks from the previous connection
+        // can detect they belong to a stale generation and self-discard.
+        connectionGeneration += 1
 
         isConnecting = true
         autoReconnectEnabled = true
@@ -304,7 +331,12 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
                     self.handleEngineIOMessage(packet)
                 }
 
-                // Step 4: Start continuous receive loop
+                // Step 4: Start continuous receive loop.
+                // Cancel any previously-running loop BEFORE starting a new one.
+                // Without this, a reconnect would overwrite pollingReceiveTask,
+                // losing the handle to the old task — leaving two polling loops
+                // racing to read packets from the same session simultaneously.
+                self.pollingReceiveTask?.cancel()
                 self.pollingReceiveTask = Task { [weak self] in
                     await self?.pollingReceiveLoop(sid: sid)
                 }
@@ -442,16 +474,27 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
         disconnectInternal()
         isConnected = false
         isConnecting = false
+        isUserJoined = false
         connectionState = .disconnected
     }
 
-    /// Updates the auth token. If connected, re-authenticates.
+    /// Updates the auth token. If connected, re-authenticates and waits for the
+    /// `user-join` ack before considering the socket ready again.
     func updateAuthToken(_ token: String?) {
         authToken = token
-        if isConnected, let token, !token.isEmpty {
-            emit("user-join", data: ["auth": ["token": token]])
+        guard isConnected, let token, !token.isEmpty else { return }
+        isUserJoined = false
+        Task { [weak self] in
+            guard let self else { return }
+            let result = await self.emitWithAck("user-join", data: ["auth": ["token": token]], timeout: 5.0)
+            guard self.isConnected else { return }
+            self.isUserJoined = true
+            if result == nil {
+                self.logger.warning("updateAuthToken: user-join ack timed out — proceeding optimistically")
+            }
         }
     }
+
 
     // MARK: - Emit
 
@@ -487,6 +530,84 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
         // Engine.IO MESSAGE "4" + Socket.IO ACK "3" + ack ID + payload array
         send("43\(ackId)\(jsonString)")
     }
+
+    /// Emits a Socket.IO event and waits for the server's ACK response, e.g. `user-join`
+    /// which the server replies to with `{'id': user.id, 'name': user.name}`.
+    ///
+    /// This is essential for events where the client must know the server has fully
+    /// processed the request (e.g. joined the `user:{id}` room) before proceeding —
+    /// simply firing `emit()` and assuming success is what caused chat events to be
+    /// silently dropped when a message was sent in the brief window between the
+    /// Socket.IO CONNECT ack and the `user-join` ack actually completing server-side.
+    ///
+    /// Returns `nil` if the ack does not arrive within `timeout` seconds, or if the
+    /// socket disconnects while waiting.
+    @discardableResult
+    func emitWithAck(_ event: String, data: Any? = nil, timeout: TimeInterval = 5.0) async -> Any? {
+        var payload: [Any] = [event]
+        if let data {
+            payload.append(data)
+        }
+
+        let ackId: Int = ackLock.withLock {
+            nextAckId += 1
+            return nextAckId
+        }
+
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+              let jsonString = String(data: jsonData, encoding: .utf8)
+        else { return nil }
+
+        // Use withTaskCancellationHandler so that if the calling Task is cancelled
+        // (e.g. the app backgrounds and the caller is torn down), the pending ack
+        // is cleaned up and the continuation is resumed, preventing a continuation leak.
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let resumeLock = OSAllocatedUnfairLock(initialState: false)
+                func resumeOnce(_ value: Any?) {
+                    let shouldResume = resumeLock.withLock { done -> Bool in
+                        guard !done else { return false }
+                        done = true
+                        return true
+                    }
+                    guard shouldResume else { return }
+                    continuation.resume(returning: value)
+                }
+
+                ackLock.withLock {
+                    pendingAcks[ackId] = { data in
+                        resumeOnce(data)
+                    }
+                }
+
+                // Socket.IO EVENT packet WITH ack ID: "42<ackId>[eventName, payload]"
+                send("42\(ackId)\(jsonString)")
+
+                // Use Task.sleep instead of DispatchQueue.main.asyncAfter so the timeout
+                // fires reliably regardless of whether the main RunLoop is active (e.g.
+                // while the app is backgrounded). DispatchQueue.main.asyncAfter can be
+                // delayed or never fire when the main thread is suspended, leaving the
+                // Swift continuation alive forever — a guaranteed memory/resource leak.
+                Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    guard let self else { return }
+                    self.ackLock.withLock { self.pendingAcks.removeValue(forKey: ackId) }
+                    resumeOnce(nil)
+                }
+            }
+        } onCancel: { [weak self] in
+            // Task was cancelled — clean up the pending ack so it doesn't linger.
+            guard let self else { return }
+            self.ackLock.withLock { self.pendingAcks.removeValue(forKey: ackId) }
+        }
+    }
+
+    /// Invokes and removes the pending ack callback for the given ID, if present.
+    private func resolveAck(_ ackId: Int, data: Any?) {
+        let callback = ackLock.withLock { pendingAcks.removeValue(forKey: ackId) }
+        callback?(data)
+    }
+
 
     // MARK: - Event Registration
 
@@ -574,21 +695,33 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
         handlerLock.unlock()
     }
 
-    /// Ensures the socket is connected, waiting up to the given timeout.
+    /// Ensures the socket is connected AND has successfully joined the user's
+    /// room (user-join acknowledged), waiting up to the given timeout.
+    ///
+    /// Waiting for `isUserJoined` — not just `isConnected` — is critical: a
+    /// socket can be "connected" from the Engine.IO/Socket.IO handshake's
+    /// perspective while the server has not yet added it to `user:{id}`,
+    /// which is the room chat/channel events are emitted to. Proceeding to
+    /// send a chat message before that join completes causes the response
+    /// to be silently dropped by the server with no error on either side.
     func ensureConnected(timeout: TimeInterval = 2.0) async -> Bool {
-        if isConnected { return true }
+        if isConnected && isUserJoined { return true }
 
         connect()
 
-        // Poll for connection
+        // Poll for connection + room join
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if isConnected { return true }
+            if isConnected && isUserJoined { return true }
             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
         }
 
+        // Timed out — if at least connected, allow the caller to proceed
+        // (isUserJoined's own timeout logic already defaults to true after
+        // 5s to avoid blocking forever on servers that ack slowly).
         return isConnected
     }
+
 
     // MARK: - Cleanup
 
@@ -759,15 +892,42 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
 
             startPing()
 
-            // Send user-join with auth
-            if let token = authToken, !token.isEmpty {
-                emit("user-join", data: ["auth": ["token": token]])
-            }
-
             // Start heartbeat
             startHeartbeat()
 
             logger.info("Socket.IO connected, sid=\(self.sid ?? "nil")")
+
+            // Join the user's room. This MUST complete (ack received) before the
+            // socket is considered ready for anything that depends on server-side
+            // event delivery (sending a chat message). Firing user-join without
+            // waiting for its ack was the root cause of chat responses silently
+            // vanishing: sendMessage() would see isConnected == true and proceed
+            // immediately, but the server hadn't yet added the socket to the
+            // user:{id} room, so all subsequent `events` emissions were dropped.
+            isUserJoined = false
+            if let token = authToken, !token.isEmpty {
+                Task { [weak self] in
+                    guard let self else { return }
+                    let result = await self.emitWithAck("user-join", data: ["auth": ["token": token]], timeout: 5.0)
+                    // Only mark joined if we're still on the same connection —
+                    // a disconnect/reconnect in the meantime should not resurrect this.
+                    guard self.isConnected else { return }
+                    if result != nil {
+                        self.isUserJoined = true
+                        self.logger.info("user-join acknowledged, sid=\(self.sid ?? "nil")")
+                    } else {
+                        // Ack timed out — assume joined anyway rather than blocking
+                        // sends forever. Older server versions may not ack promptly,
+                        // and the CONNECT handshake itself may have already joined
+                        // the room via the auth-carrying handshake payload.
+                        self.isUserJoined = true
+                        self.logger.warning("user-join ack timed out — proceeding optimistically")
+                    }
+                }
+            } else {
+                // No token to join with (shouldn't normally happen) — don't block forever.
+                isUserJoined = true
+            }
 
             DispatchQueue.main.async { [weak self] in
                 self?.onConnect?()
@@ -778,6 +938,7 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
                     self?.onReconnect?()
                 }
             }
+
 
         case "1":
             // Socket.IO DISCONNECT
@@ -800,13 +961,28 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
             parseAndDispatchEvent(jsonStr, ackId: ackId)
 
         case "3":
-            // Socket.IO ACK - not currently used
-            break
+            // Socket.IO ACK — server responding to a client-initiated emitWithAck().
+            // Format: `3<ackId>[responseValue]` or `3<ackId>` with no payload.
+            let rest = String(raw.dropFirst())
+            var digitsEnd = rest.startIndex
+            while digitsEnd < rest.endIndex, rest[digitsEnd].isNumber {
+                digitsEnd = rest.index(after: digitsEnd)
+            }
+            let idStr = String(rest[rest.startIndex..<digitsEnd])
+            guard let id = Int(idStr) else { break }
+            let jsonPart = String(rest[digitsEnd...])
+            var ackValue: Any? = nil
+            if let jsonData = jsonPart.data(using: .utf8),
+               let array = try? JSONSerialization.jsonObject(with: jsonData) as? [Any] {
+                ackValue = array.first
+            }
+            resolveAck(id, data: ackValue)
 
         case "4":
             // Socket.IO ERROR
             let errorStr = String(raw.dropFirst())
             logger.error("Socket.IO error: \(errorStr)")
+
 
         default:
             // Try parsing as a plain event if prefixed with a digit (e.g., "2[...]")
@@ -831,6 +1007,14 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
         } else {
             payload = [:]
         }
+
+        // 🔍 DIAGNOSTIC: log every socket event name + nested type
+        let nestedType = (payload["data"] as? [String: Any])?["type"] as? String
+            ?? payload["type"] as? String
+            ?? "?"
+        let chatId = payload["chat_id"] as? String ?? "nil"
+        let msgId = payload["message_id"] as? String ?? "nil"
+        logger.info("🔌 [Socket] event=\(eventName, privacy: .public) type=\(nestedType, privacy: .public) chat_id=\(chatId, privacy: .public) msg_id=\(msgId, privacy: .public)")
 
         switch eventName {
         case "events", "chat-events":
@@ -952,26 +1136,21 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
 
     // MARK: - Private: Heartbeat & Ping
 
+    /// Starts the OpenWebUI `heartbeat` Socket.IO event timer.
+    ///
+    /// Engine.IO v4 heartbeat direction: **server sends PING, client responds PONG**.
+    /// The `case "2": send("3")` in `handleEngineIOMessage` already handles that correctly.
+    /// We must NOT send Engine.IO "2" packets from the client — that would be the wrong
+    /// direction per the EIO4 spec and wastes a connection slot on every tick.
+    ///
+    /// This timer only sends the Socket.IO-level `heartbeat` event that OpenWebUI uses
+    /// to track `last_seen_at` in SESSION_POOL. It does NOT send Engine.IO PINGs.
     private func startPing() {
         stopPing()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.pingTimer = Timer.scheduledTimer(
-                withTimeInterval: self.pingInterval,
-                repeats: true
-            ) { [weak self] _ in
-                self?.send("2") // Engine.IO PING
-            }
-        }
-    }
-
-    private func startHeartbeat() {
-        // Invalidate any previous heartbeat timer to prevent accumulation
-        // across reconnections (each connect() calls startHeartbeat()).
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.heartbeatTimer?.invalidate()
-            // OpenWebUI expects a heartbeat event every 30 seconds
+            // OpenWebUI expects a Socket.IO `heartbeat` event every 30 seconds
+            // to update last_seen_at in SESSION_POOL.
             self.heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] timer in
                 guard let self, self.isConnected else {
                     timer.invalidate()
@@ -980,6 +1159,11 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
                 self.emit("heartbeat", data: [:] as [String: Any])
             }
         }
+    }
+
+    private func startHeartbeat() {
+        // No-op: heartbeat is now consolidated into startPing() above.
+        // Engine.IO v4 PING/PONG is handled server→client in handleEngineIOMessage.
     }
 
     private func stopPing() {
@@ -1004,7 +1188,9 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
         let wasConnected = isConnected
         isConnected = false
         isConnecting = false
+        isUserJoined = false
         stopPing()
+
 
         if wasConnected {
             logger.warning("Socket disconnected: \(reason ?? "unknown")")

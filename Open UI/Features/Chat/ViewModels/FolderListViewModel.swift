@@ -14,6 +14,9 @@ final class FolderListViewModel {
     /// All folders (flat list) from the server.
     var folders: [ChatFolder] = []
 
+    /// Folders shared *with* the current user (not owned by them).
+    var sharedFolders: [ChatFolder] = []
+
     /// Whether the initial folder load is in progress.
     var isLoading: Bool = false
 
@@ -40,6 +43,11 @@ final class FolderListViewModel {
 
     /// Non-nil when folders feature is confirmed disabled on this server.
     var featureDisabled: Bool = false
+
+    /// IDs of pinned conversations — used to exclude them from folder chat lists
+    /// so a pinned folder chat doesn't appear both in the Pinned section AND
+    /// inside its folder at the same time.
+    var pinnedChatIds: Set<String> = []
 
     /// ID of a folder currently highlighted as a drag drop target.
     var dragTargetFolderId: String?
@@ -198,11 +206,16 @@ final class FolderListViewModel {
 
     /// Loads folders from the server. Call on appear and after refresh.
     /// Automatically fetches chats for any folder that starts expanded.
+    /// Also loads folders shared with the current user in parallel.
     func loadFolders() async {
         guard let manager, !isLoading else { return }
         isLoading = true
         do {
-            let (fetched, enabled) = try await manager.fetchFolders()
+            async let ownedRequest = manager.fetchFolders()
+            async let sharedRequest = (try? manager.fetchSharedFolders()) ?? []
+
+            let (result, fetchedShared) = try await (ownedRequest, sharedRequest)
+            let (fetched, enabled) = result
             featureDisabled = !enabled
             if enabled {
                 // Preserve local expand states so UI doesn't flicker
@@ -235,6 +248,22 @@ final class FolderListViewModel {
                     }
                 }
             }
+
+            // Merge shared folders, preserving existing expand/chat state
+            let existingSharedExpandState = Dictionary(
+                uniqueKeysWithValues: sharedFolders.map { ($0.id, $0.isExpanded) }
+            )
+            let existingSharedChats = Dictionary(
+                uniqueKeysWithValues: sharedFolders.map { ($0.id, $0.chats) }
+            )
+            sharedFolders = fetchedShared.map { folder in
+                var f = folder
+                if let existing = existingSharedExpandState[folder.id] { f.isExpanded = existing }
+                if let chats = existingSharedChats[folder.id], !chats.isEmpty { f.chats = chats }
+                return f
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
         } catch {
             logger.error("Failed to load folders: \(error.localizedDescription)")
         }
@@ -253,6 +282,19 @@ final class FolderListViewModel {
             }
         } catch {
             logger.error("Failed to load chats for folder \(folder.id): \(error.localizedDescription)")
+        }
+    }
+
+    /// Force-reloads the chats inside a folder regardless of its expanded state.
+    /// Used after unpinning a folder chat so it reappears in the sidebar immediately.
+    func refreshFolderChats(id folderId: String) async {
+        guard let manager else { return }
+        guard let idx = folders.firstIndex(where: { $0.id == folderId }) else { return }
+        do {
+            let chats = try await manager.fetchChatsInFolder(folderId: folderId)
+            folders[idx].chats = chats
+        } catch {
+            logger.error("Failed to refresh chats for folder \(folderId): \(error.localizedDescription)")
         }
     }
 
@@ -641,6 +683,57 @@ final class FolderListViewModel {
         autoExpandedFolderId = nil
     }
 
+    // MARK: - Sharing
+
+    /// Updates access grants for a folder and refreshes its local state.
+    /// Optimistically updates the `accessGrants` and `isPublic` fields so
+    /// the Share sheet reflects the latest state immediately.
+    func updateFolderAccess(folderId: String, accessGrants: [AccessGrant], isPublic: Bool) async {
+        guard let manager else { return }
+
+        // Optimistic update
+        if let idx = folders.firstIndex(where: { $0.id == folderId }) {
+            folders[idx].accessGrants = accessGrants
+            folders[idx].isPublic = isPublic
+        }
+
+        do {
+            var updatedFolder = folders.first(where: { $0.id == folderId })
+                ?? ChatFolder(id: folderId, name: "")
+            updatedFolder.accessGrants = accessGrants
+            updatedFolder.isPublic = isPublic
+            let result = try await manager.updateFolderAccess(folder: updatedFolder)
+            if let idx = folders.firstIndex(where: { $0.id == folderId }) {
+                folders[idx].accessGrants = result.accessGrants
+                folders[idx].isPublic = result.isPublic
+            }
+        } catch {
+            logger.error("Failed to update folder access: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Shared Folder Expand / Chats
+
+    /// Toggles the expanded state of a shared folder and lazily loads its chats.
+    func toggleSharedFolderExpanded(folder: ChatFolder) async {
+        guard let manager,
+              let idx = sharedFolders.firstIndex(where: { $0.id == folder.id }) else { return }
+        let newExpanded = !sharedFolders[idx].isExpanded
+        sharedFolders[idx].isExpanded = newExpanded
+
+        if newExpanded, sharedFolders[idx].chats.isEmpty {
+            do {
+                let (chats, readonly) = try await manager.fetchSharedFolderChats(folderId: folder.id)
+                if let i = sharedFolders.firstIndex(where: { $0.id == folder.id }) {
+                    sharedFolders[i].chats = chats
+                    sharedFolders[i].readonly = readonly
+                }
+            } catch {
+                logger.error("Failed to load shared folder chats for \(folder.id): \(error.localizedDescription)")
+            }
+        }
+    }
+
     // MARK: - Refresh
 
     /// Silently refreshes folder metadata and chats for expanded folders.
@@ -649,6 +742,12 @@ final class FolderListViewModel {
     /// resume, and socket reconnect.
     func refreshFolders() async {
         guard let manager else { return }
+        async let ownedRefresh: () = refreshOwnedFolders(manager: manager)
+        async let sharedRefresh: () = refreshSharedFoldersState(manager: manager)
+        _ = await (ownedRefresh, sharedRefresh)
+    }
+
+    private func refreshOwnedFolders(manager: FolderManager) async {
         do {
             let (fetched, enabled) = try await manager.fetchFolders()
             featureDisabled = !enabled
@@ -694,6 +793,27 @@ final class FolderListViewModel {
             }
         } catch {
             logger.error("Failed to refresh folders: \(error.localizedDescription)")
+        }
+    }
+
+    private func refreshSharedFoldersState(manager: FolderManager) async {
+        do {
+            let fetched = try await manager.fetchSharedFolders()
+            let existingExpandState = Dictionary(
+                uniqueKeysWithValues: sharedFolders.map { ($0.id, $0.isExpanded) }
+            )
+            let existingChats = Dictionary(
+                uniqueKeysWithValues: sharedFolders.map { ($0.id, $0.chats) }
+            )
+            sharedFolders = fetched.map { folder in
+                var f = folder
+                if let existing = existingExpandState[folder.id] { f.isExpanded = existing }
+                if let chats = existingChats[folder.id], !chats.isEmpty { f.chats = chats }
+                return f
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        } catch {
+            // Silently swallow — shared folders feature may not be enabled on older servers
         }
     }
 

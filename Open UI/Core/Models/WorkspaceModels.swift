@@ -897,6 +897,9 @@ struct FunctionItem: Identifiable, Sendable {
     /// Whether this filter function has a per-message toggle (meta.toggle: true).
     /// When true, the filter should appear as a toggleable tool in the ToolsMenuSheet.
     var hasToggle: Bool
+    /// Whether this function exposes user-configurable valve settings.
+    /// Populated from `has_user_valves` in the server response.
+    var hasUserValves: Bool
 
     init?(json: [String: Any]) {
         guard let id = json["id"] as? String,
@@ -910,6 +913,7 @@ struct FunctionItem: Identifiable, Sendable {
         self.isActive = json["is_active"] as? Bool ?? true
         self.isGlobal = json["is_global"] as? Bool ?? false
         self.hasToggle = meta["toggle"] as? Bool ?? false
+        self.hasUserValves = json["has_user_valves"] as? Bool ?? false
         let manifest = meta["manifest"] as? [String: Any] ?? [:]
         self.version = manifest["version"] as? String
         self.authorName = manifest["author"] as? String
@@ -1087,13 +1091,18 @@ struct ModelItem: Identifiable, Sendable {
 
         // Prefer info{} values, fall back to root for older endpoints
         self.isActive   = info["is_active"]   as? Bool   ?? json["is_active"]   as? Bool   ?? true
-        self.writeAccess = info["write_access"] as? Bool  ?? json["write_access"] as? Bool  ?? true
+        // Default write_access to false (not true) — non-owners must not see edit UI
+        self.writeAccess = info["write_access"] as? Bool  ?? json["write_access"] as? Bool  ?? false
         self.userId     = info["user_id"]     as? String ?? json["user_id"]     as? String ?? ""
         self.baseModelId = info["base_model_id"] as? String ?? json["base_model_id"] as? String
 
-        // isPublic: check access_grants for an entry with principal_id == "*" (same logic as web UI)
-        let grants = info["access_grants"] as? [[String: Any]] ?? []
-        self.isPublic = grants.contains { $0["principal_id"] as? String == "*" }
+        // isPublic: check access_grants for principal_id == "*" at BOTH info-level (list endpoint)
+        // and root-level (single-model endpoint) — the backend moves access_grants to root when
+        // write_access == true and paginates via /api/v1/models/list.
+        let infoGrants = info["access_grants"] as? [[String: Any]] ?? []
+        let rootGrants = json["access_grants"] as? [[String: Any]] ?? []
+        let allGrants  = infoGrants.isEmpty ? rootGrants : infoGrants
+        self.isPublic = allGrants.contains { $0["principal_id"] as? String == "*" }
 
         // meta lives at info.meta for /api/models; at root meta for /api/v1/models/base
         let infoMeta = info["meta"] as? [String: Any] ?? [:]
@@ -1192,10 +1201,13 @@ struct ModelDetail: Identifiable, Sendable {
     var builtinChats: Bool
     var builtinNotes: Bool
     var builtinKnowledge: Bool
+    var builtinFiles: Bool
     var builtinChannels: Bool
+    var builtinNotifications: Bool
     var builtinTaskManagement: Bool
     var builtinAutomations: Bool
     var builtinCalendar: Bool
+    var builtinSubagents: Bool
     var builtinWebSearch: Bool
     var builtinImageGen: Bool
     var builtinCodeInterpreter: Bool
@@ -1272,8 +1284,10 @@ struct ModelDetail: Identifiable, Sendable {
          defaultFeatureWebSearch: Bool = true, defaultFeatureImageGen: Bool = false,
          defaultFeatureCodeInterpreter: Bool = false,
          builtinTime: Bool = true, builtinMemory: Bool = true, builtinChats: Bool = true,
-         builtinNotes: Bool = true, builtinKnowledge: Bool = true, builtinChannels: Bool = true,
+         builtinNotes: Bool = true, builtinKnowledge: Bool = true, builtinFiles: Bool = true,
+         builtinChannels: Bool = true, builtinNotifications: Bool = true,
          builtinTaskManagement: Bool = true, builtinAutomations: Bool = true, builtinCalendar: Bool = true,
+         builtinSubagents: Bool = true,
          builtinWebSearch: Bool = true, builtinImageGen: Bool = true, builtinCodeInterpreter: Bool = true,
          knowledgeItems: [ModelKnowledgeEntry] = [], suggestionPrompts: [SuggestionPrompt] = [],
          ttsVoice: String = "") {
@@ -1291,9 +1305,10 @@ struct ModelDetail: Identifiable, Sendable {
         self.defaultFeatureCodeInterpreter = defaultFeatureCodeInterpreter
         self.builtinTime = builtinTime; self.builtinMemory = builtinMemory; self.builtinChats = builtinChats
         self.builtinNotes = builtinNotes; self.builtinKnowledge = builtinKnowledge
-        self.builtinChannels = builtinChannels
+        self.builtinFiles = builtinFiles; self.builtinChannels = builtinChannels
+        self.builtinNotifications = builtinNotifications
         self.builtinTaskManagement = builtinTaskManagement; self.builtinAutomations = builtinAutomations
-        self.builtinCalendar = builtinCalendar
+        self.builtinCalendar = builtinCalendar; self.builtinSubagents = builtinSubagents
         self.builtinWebSearch = builtinWebSearch
         self.builtinImageGen = builtinImageGen; self.builtinCodeInterpreter = builtinCodeInterpreter
         self.knowledgeItems = knowledgeItems; self.suggestionPrompts = suggestionPrompts
@@ -1386,10 +1401,14 @@ struct ModelDetail: Identifiable, Sendable {
         self.builtinChats = bt["chats"] as? Bool ?? true
         self.builtinNotes = bt["notes"] as? Bool ?? true
         self.builtinKnowledge = bt["knowledge"] as? Bool ?? true
+        self.builtinFiles = bt["files"] as? Bool ?? true
         self.builtinChannels = bt["channels"] as? Bool ?? true
-        self.builtinTaskManagement = bt["task_management"] as? Bool ?? true
+        self.builtinNotifications = bt["notifications"] as? Bool ?? true
+        // Web UI uses "tasks" as the key (not "task_management")
+        self.builtinTaskManagement = bt["tasks"] as? Bool ?? bt["task_management"] as? Bool ?? true
         self.builtinAutomations = bt["automations"] as? Bool ?? true
         self.builtinCalendar = bt["calendar"] as? Bool ?? true
+        self.builtinSubagents = bt["subagents"] as? Bool ?? true
         self.builtinWebSearch = bt["web_search"] as? Bool ?? true
         self.builtinImageGen = bt["image_generation"] as? Bool ?? true
         self.builtinCodeInterpreter = bt["code_interpreter"] as? Bool ?? true
@@ -1517,9 +1536,11 @@ struct ModelDetail: Identifiable, Sendable {
         meta["defaultFeatureIds"] = defF
         meta["builtinTools"] = [
             "time": builtinTime, "memory": builtinMemory, "chats": builtinChats,
-            "notes": builtinNotes, "knowledge": builtinKnowledge, "channels": builtinChannels,
-            "task_management": builtinTaskManagement, "automations": builtinAutomations,
-            "calendar": builtinCalendar,
+            "notes": builtinNotes, "knowledge": builtinKnowledge, "files": builtinFiles,
+            "channels": builtinChannels, "notifications": builtinNotifications,
+            // Web UI key is "tasks" (not "task_management")
+            "tasks": builtinTaskManagement, "automations": builtinAutomations,
+            "calendar": builtinCalendar, "subagents": builtinSubagents,
             "web_search": builtinWebSearch, "image_generation": builtinImageGen,
             "code_interpreter": builtinCodeInterpreter
         ]

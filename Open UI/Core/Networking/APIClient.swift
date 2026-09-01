@@ -6,6 +6,8 @@ final class APIClient: @unchecked Sendable {
     let network: NetworkManager
     private let logger = Logger(subsystem: "com.openui", category: "API")
 
+    /// The role of the currently signed-in user ("admin", "user", etc.).
+    /// Set by DependencyContainer after login so parseModelArray can use it.
     /// Callback invoked when the auth token is rejected (401). Thread-safe via lock.
     private let _authCallbackLock = NSLock()
     private var _onAuthTokenInvalid: (() -> Void)?
@@ -19,6 +21,9 @@ final class APIClient: @unchecked Sendable {
             _authCallbackLock.lock()
             _onAuthTokenInvalid = newValue
             _authCallbackLock.unlock()
+            // Keep NetworkManager in sync so any 401 from any request method
+            // (not just those routed through APIClient) triggers sign-out.
+            network.onTokenExpired = newValue
         }
     }
 
@@ -117,7 +122,22 @@ final class APIClient: @unchecked Sendable {
             let statusCode = httpResponse.statusCode
 
             if [302, 307, 308].contains(statusCode) {
-                return (.proxyAuthRequired, nil)
+                // Only treat as proxy auth if the redirect goes to a DIFFERENT domain.
+                // Same-domain redirects (e.g. nginx redirecting /health → /health/) are
+                // normal HTTP behaviour and must NOT trigger the proxy auth WebView.
+                let location = httpResponse.value(forHTTPHeaderField: "Location") ?? ""
+                let serverHost = URL(string: network.serverConfig.url)?.host?.lowercased() ?? ""
+                if let locationURL = URL(string: location),
+                   let locationHost = locationURL.host?.lowercased(),
+                   !locationHost.isEmpty,
+                   locationHost != serverHost,
+                   !locationHost.hasSuffix(".\(serverHost)"),
+                   !serverHost.hasSuffix(".\(locationHost)") {
+                    // Cross-domain redirect → genuine auth proxy
+                    return (.proxyAuthRequired, nil)
+                }
+                // Same-domain or relative redirect → treat as healthy; URLSession follows it
+                return (.healthy, finalURL)
             }
 
             if [401, 403].contains(statusCode) {
@@ -359,8 +379,54 @@ final class APIClient: @unchecked Sendable {
         network.deleteAuthToken()
     }
 
+    // MARK: - API Key Management
+
+    /// Generates (or regenerates) a user API key.
+    /// POST /api/v1/auths/api_key → returns {"api_key": "sk-..."}
+    func generateApiKey() async throws -> String {
+        let json = try await network.requestJSON(
+            path: "/api/v1/auths/api_key",
+            method: .post
+        )
+        guard let key = json["api_key"] as? String, !key.isEmpty else {
+            throw APIError.responseDecoding(
+                underlying: NSError(domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "No api_key in response"]),
+                data: nil
+            )
+        }
+        return key
+    }
+
+    /// Fetches the current user API key.
+    /// GET /api/v1/auths/api_key → returns {"api_key": "sk-..."} or {"api_key": null}
+    func getApiKey() async throws -> String? {
+        let json = try await network.requestJSON(path: "/api/v1/auths/api_key")
+        return json["api_key"] as? String
+    }
+
+    /// Permanently deletes (revokes) the current user API key.
+    /// DELETE /api/v1/auths/api_key → returns true on success
+    func deleteApiKey() async throws {
+        try await network.requestVoid(path: "/api/v1/auths/api_key", method: .delete)
+    }
+
     func getCurrentUser() async throws -> User {
-        try await network.request(User.self, path: "/api/v1/auths/")
+        // Use requestRaw + plain JSONDecoder (no .convertFromSnakeCase) so that
+        // User's explicit CodingKeys (which use snake_case raw values like "date_of_birth",
+        // "is_active", "profile_image_url") match the JSON keys exactly.
+        // NetworkManager.request() sets keyDecodingStrategy = .convertFromSnakeCase, which
+        // pre-transforms "date_of_birth" → "dateOfBirth" before matching CodingKeys — but
+        // User.CodingKeys declares the raw value as "date_of_birth", so the key is never
+        // found and dateOfBirth decodes as nil even when the server sends it correctly.
+        let (data, _) = try await network.requestRaw(path: "/api/v1/auths/")
+        do {
+            let decoder = JSONDecoder()
+            // No keyDecodingStrategy — User has explicit CodingKeys with snake_case raw values
+            return try decoder.decode(User.self, from: data)
+        } catch {
+            throw APIError.responseDecoding(underlying: error, data: data)
+        }
     }
 
     func updateAuthToken(_ token: String?) {
@@ -389,6 +455,31 @@ final class APIClient: @unchecked Sendable {
         }
         if let modelsArray = payload["models"] as? [[String: Any]] {
             return parseModelArray(modelsArray)
+        }
+
+        return []
+    }
+
+    /// Fetches all models including ones marked as hidden — for use in the workspace
+    /// model editor base model picker, where admins need to see every enabled model
+    /// (including hidden ones) when creating or editing a workspace model.
+    /// Mirrors OpenWebUI's `getBaseModelItems()` which shows hidden models to admins.
+    func getModelsIncludingHidden() async throws -> [AIModel] {
+        let (data, _) = try await network.requestRaw(path: "/api/models")
+
+        guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            if let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                return parseModelArray(array, includeHidden: true)
+            }
+            return []
+        }
+
+        if let modelsArray = payload["data"] as? [[String: Any]] {
+            return parseModelArray(modelsArray, includeHidden: true)
+        }
+        if let modelsArray = payload["models"] as? [[String: Any]] {
+            return parseModelArray(modelsArray, includeHidden: true)
         }
 
         return []
@@ -619,10 +710,7 @@ final class APIClient: @unchecked Sendable {
 
     // MARK: - Conversations
 
-    /// Fetches conversations including pinned status.
-    ///
-    /// The list endpoint's `ChatTitleIdResponse` doesn't include a `pinned` field,
-    /// so we parallel-fetch `/api/v1/chats/pinned` and merge the IDs in.
+    /// Fetches conversations (excluding folder chats).
     func getConversations(limit: Int? = nil, skip: Int? = nil) async throws -> [Conversation] {
         var queryItems: [URLQueryItem] = [
             URLQueryItem(name: "include_folders", value: "false"),
@@ -634,16 +722,10 @@ final class APIClient: @unchecked Sendable {
             queryItems.append(URLQueryItem(name: "page", value: "\(max(1, page))"))
         }
 
-        let capturedQueryItems = queryItems
-
-        async let conversationsRequest = network.requestRaw(
+        let (data, _) = try await network.requestRaw(
             path: "/api/v1/chats/",
-            queryItems: capturedQueryItems
+            queryItems: queryItems
         )
-        async let pinnedIdsRequest = getPinnedConversationIds()
-
-        let (data, _) = try await conversationsRequest
-        let pinnedIds = (try? await pinnedIdsRequest) ?? Set<String>()
 
         guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             throw APIError.responseDecoding(
@@ -655,12 +737,7 @@ final class APIClient: @unchecked Sendable {
             )
         }
 
-        return array.compactMap { parseConversationSummary($0) }.map { conv in
-            guard !pinnedIds.isEmpty, pinnedIds.contains(conv.id) else { return conv }
-            var pinned = conv
-            pinned.pinned = true
-            return pinned
-        }
+        return array.compactMap { parseConversationSummary($0) }
     }
 
     /// Fetches a specific page of conversations.
@@ -697,31 +774,40 @@ final class APIClient: @unchecked Sendable {
         }
     }
 
-    /// Fetches pinned conversation IDs from the dedicated `/api/v1/chats/pinned` endpoint.
-    /// The list endpoint doesn't include pinned status in its response schema.
-    func getPinnedConversationIds() async throws -> Set<String> {
+    /// Fetches all pinned conversations from `/api/v1/chats/pinned` as full `Conversation` objects.
+    /// This is the canonical source of truth for the Pinned section — it includes folder chats
+    /// that are excluded from the regular paginated list.
+    func getPinnedConversations() async throws -> [Conversation] {
         let (data, _) = try await network.requestRaw(path: "/api/v1/chats/pinned")
         guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             return []
         }
-        let ids = array.compactMap { $0["id"] as? String }
-        return Set(ids)
+        return array.compactMap { dict -> Conversation? in
+            guard var conv = parseConversationSummary(dict) else { return nil }
+            conv.pinned = true
+            return conv
+        }
     }
 
     func getConversation(id: String) async throws -> Conversation {
         let (data, _) = try await network.requestRaw(path: "/api/v1/chats/\(id)")
 
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw APIError.responseDecoding(
-                underlying: NSError(
-                    domain: "APIError", code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "Expected chat object"]
-                ),
-                data: data
-            )
-        }
-
-        return parseFullConversation(json)
+        // Parse the full conversation (MessageHistory.fromServerJSON + InlineImageStore.extractAndReplace
+        // per node) on a background thread so we never block the main actor — even when called from a
+        // @MainActor context like ChatViewModel.loadConversation(). Large chats with hundreds of messages
+        // and base64 image nodes were causing the app to freeze on launch when auto-restoring a chat.
+        return try await Task.detached(priority: .userInitiated) { [self] in
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw APIError.responseDecoding(
+                    underlying: NSError(
+                        domain: "APIError", code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Expected chat object"]
+                    ),
+                    data: data
+                )
+            }
+            return await self.parseFullConversation(json)
+        }.value
     }
 
     /// Creates a new permanent chat on the server using the full history payload.
@@ -900,6 +986,30 @@ final class APIClient: @unchecked Sendable {
         return parseFullConversation(json)
     }
 
+    /// Forks a conversation at a specific message using POST /api/v1/chats/{id}/fork.
+    /// The server creates a new chat containing only messages up to and including `messageId`.
+    /// Matches open-webui's `forkChatById` behaviour exactly.
+    func forkConversation(id: String, messageId: String) async throws -> Conversation {
+        let body = try JSONSerialization.data(withJSONObject: ["message_id": messageId])
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/chats/\(id)/fork",
+            method: .post,
+            body: body
+        )
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw APIError.responseDecoding(
+                underlying: NSError(
+                    domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Expected chat object"]
+                ),
+                data: data
+            )
+        }
+
+        return parseFullConversation(json)
+    }
+
     func searchConversations(query: String) async throws -> [Conversation] {
         let (data, _) = try await network.requestRaw(
             path: "/api/v1/chats/search",
@@ -1003,7 +1113,8 @@ final class APIClient: @unchecked Sendable {
         model: String?,
         systemPrompt: String? = nil,
         chatParams: ChatAdvancedParams? = nil,
-        title: String? = nil
+        title: String? = nil,
+        chatFiles: [ChatMessageFile] = []
     ) async throws {
         // Build the flat messages array from the current branch (for server compat)
         let flatMessages = history.createMessagesList()
@@ -1024,6 +1135,19 @@ final class APIClient: @unchecked Sendable {
             paramsDict["system"] = sp
         }
 
+        // Serialize chat-level files (mirrors OWUI `chat.files` in the save payload)
+        let filesArray: [[String: Any]] = chatFiles.compactMap { file -> [String: Any]? in
+            guard let url = file.url else { return nil }
+            var dict: [String: Any] = [
+                "type": file.type ?? "file",
+                "id": url,
+                "url": url
+            ]
+            if let name = file.name { dict["name"] = name }
+            if let ct = file.contentType { dict["content_type"] = ct }
+            return dict
+        }
+
         var chat: [String: Any] = [
             "id": "",
             "title": title ?? "",
@@ -1031,6 +1155,7 @@ final class APIClient: @unchecked Sendable {
             "params": paramsDict,
             "history": history.toServerDict(),
             "messages": messagesArray,
+            "files": filesArray,
             "tags": [String](),
             "timestamp": Int(Date().timeIntervalSince1970 * 1000)
         ]
@@ -1087,6 +1212,17 @@ final class APIClient: @unchecked Sendable {
         )
     }
 
+    /// Stops all active server-side tasks for a given chat in a single request.
+    /// Mirrors open-webui's `stopTasksByChatId(chat_id)` → POST `/api/tasks/chat/{id}/stop`.
+    /// Called from `stopStreaming()` when `activeTaskId` is nil (external stream),
+    /// and always when cancelling — avoids a loop of individual stopTask() calls.
+    func stopTasksByChatId(chatId: String) async throws {
+        try await network.requestVoid(
+            path: "/api/tasks/chat/\(chatId)/stop",
+            method: .post
+        )
+    }
+
     func getTasksForChat(chatId: String) async throws -> [String] {
         let (data, _) = try await network.requestRaw(path: "/api/tasks/chat/\(chatId)")
         let parsed = try JSONSerialization.jsonObject(with: data)
@@ -1105,6 +1241,81 @@ final class APIClient: @unchecked Sendable {
             }
         }
         return []
+    }
+
+    /// Lightweight update of a chat's top-level `files` (and optional `params`) without
+    /// touching the message history. Mirrors OWUI's `saveControls()` → `updateChatById(token, id, { params, files })`.
+    /// `POST /api/v1/chats/{id}` with body `{ "chat": { "files": [...] } }`
+    @discardableResult
+    func updateChatControls(id: String, files: [ChatMessageFile]) async throws -> Bool {
+        let filesArray: [[String: Any]] = files.compactMap { file -> [String: Any]? in
+            guard let url = file.url else { return nil }
+            var dict: [String: Any] = ["url": url]
+            if let name = file.name { dict["name"] = name }
+            if let type_ = file.type { dict["type"] = type_ }
+            if let contentType = file.contentType { dict["content_type"] = contentType }
+            return dict
+        }
+        let body: [String: Any] = ["chat": ["files": filesArray]]
+        _ = try await network.requestRaw(
+            path: "/api/v1/chats/\(id)",
+            method: .post,
+            body: try JSONSerialization.data(withJSONObject: body)
+        )
+        return true
+    }
+
+    /// Lightweight update of a chat's `params` dict without touching message history.
+    ///
+    /// Mirrors the web client's `updateChatById(token, $chatId, { params })` call —
+    /// used to persist per-chat settings like `tool_approval_mode` without syncing
+    /// the full conversation history.
+    ///
+    /// `POST /api/v1/chats/{id}` with body `{ "chat": { "params": { ... } } }`
+    func updateChatParams(id: String, params: [String: Any]) async throws {
+        try await network.requestVoidJSON(
+            path: "/api/v1/chats/\(id)",
+            method: .post,
+            body: ["chat": ["params": params]]
+        )
+    }
+
+    // MARK: - Human-in-the-Loop: Tool Call Resolution
+
+    /// Resolves a paused (human-in-the-loop) tool call in a saved conversation.
+    ///
+    /// Mirrors the web client's `resolveChatMessageToolCall()` in `src/lib/apis/chats/index.ts`.
+    ///
+    /// - Parameters:
+    ///   - chatId: The conversation ID.
+    ///   - messageId: The assistant message ID that contains the pending tool call.
+    ///   - callId: The `call_id` of the specific `function_call` output item.
+    ///   - action: `"approve"` | `"reject"` | `"answer"` (ask_user only).
+    ///   - answers: Answer payload for `action == "answer"` — maps question ID to answer dict.
+    ///   - timedOut: `true` when the ask_user timeout elapsed with no answer.
+    /// - Returns: The raw server response dict (includes `task_ids`, `chat_id`, etc.).
+    @discardableResult
+    func resolveToolCall(
+        chatId: String,
+        messageId: String,
+        callId: String,
+        action: String,
+        answers: [String: Any]? = nil,
+        timedOut: Bool = false
+    ) async throws -> [String: Any] {
+        var body: [String: Any] = [
+            "call_id": callId,
+            "action": action
+        ]
+        if let answers { body["answers"] = answers }
+        if timedOut { body["timed_out"] = true }
+
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/chats/\(chatId)/messages/\(messageId)/resolve",
+            method: .post,
+            body: try JSONSerialization.data(withJSONObject: body)
+        )
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
     /// Updates a single task's status for the given chat.
@@ -1171,7 +1382,13 @@ final class APIClient: @unchecked Sendable {
         var existingUI = (current["ui"] as? [String: Any]) ?? [:]
         let updates = params.toUISaveDict()
         for (key, value) in updates {
-            existingUI[key] = value
+            if value is NSNull {
+                // NSNull signals "remove this key" — e.g. clearing the system prompt.
+                // Sending null in JSON leaves the server value unchanged; we must omit the key.
+                existingUI.removeValue(forKey: key)
+            } else {
+                existingUI[key] = value
+            }
         }
         try await updateUserSettings(["ui": existingUI])
     }
@@ -1330,6 +1547,43 @@ final class APIClient: @unchecked Sendable {
             folderId: folderId,
             tags: tags
         )
+    }
+
+    /// GET /api/v1/folders/shared
+    /// Returns all folders shared *with* the current user (not owned by them).
+    func getSharedFolders() async throws -> [[String: Any]] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/folders/shared")
+        if let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            return array
+        }
+        return []
+    }
+
+    /// POST /api/v1/folders/{id}/access/update
+    /// Replaces the access grants for a folder.
+    /// Pass an empty array to make the folder private (owner-only).
+    @discardableResult
+    func updateFolderAccessGrants(id: String, grants: [[String: Any]]) async throws -> [String: Any] {
+        let body: [String: Any] = ["access_grants": grants]
+        return try await network.requestJSON(
+            path: "/api/v1/folders/\(id)/access/update",
+            method: .post,
+            body: body
+        )
+    }
+
+    /// GET /api/v1/folders/{id}/shared/chats
+    /// Returns chats within a shared folder, plus a `readonly` flag.
+    /// `readonly` is true when the caller only has read permission.
+    func getSharedFolderChats(folderId: String) async throws -> (chats: [Conversation], readonly: Bool) {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/folders/\(folderId)/shared/chats")
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ([], false)
+        }
+        let readonly = root["readonly"] as? Bool ?? false
+        let chatArray = root["chats"] as? [[String: Any]] ?? []
+        let chats = chatArray.compactMap { parseFolderChatItem($0, folderId: folderId) }
+        return (chats, readonly)
     }
 
     // MARK: - Tags
@@ -2139,17 +2393,33 @@ final class APIClient: @unchecked Sendable {
 
     // MARK: - Workspace Models
 
-    /// GET /api/v1/models/list — workspace models (user-created only, not base models)
+    /// GET /api/v1/models/list — workspace models (user-created only, not base models).
+    /// The server paginates at 30 items/page (PAGE_ITEM_COUNT=30), so we loop through
+    /// all pages until we receive an empty items array or a flat (non-paginated) response.
     func listWorkspaceModels() async throws -> [ModelItem] {
-        let (data, _) = try await network.requestRaw(path: "/api/v1/models/list")
-        let json = try JSONSerialization.jsonObject(with: data)
-        let array: [[String: Any]]
-        if let dict = json as? [String: Any], let items = dict["items"] as? [[String: Any]] {
-            array = items
-        } else if let arr = json as? [[String: Any]] {
-            array = arr
-        } else { return [] }
-        return array.compactMap { ModelItem(json: $0) }
+        var allItems: [ModelItem] = []
+        var page = 1
+        while true {
+            let (data, _) = try await network.requestRaw(
+                path: "/api/v1/models/list",
+                queryItems: [URLQueryItem(name: "page", value: "\(page)")]
+            )
+            let json = try JSONSerialization.jsonObject(with: data)
+            if let dict = json as? [String: Any], let items = dict["items"] as? [[String: Any]] {
+                // Paginated response: {"items": [...], "total": N}
+                let parsed = items.compactMap { ModelItem(json: $0) }
+                allItems.append(contentsOf: parsed)
+                if parsed.isEmpty { break }
+                page += 1
+            } else if let arr = json as? [[String: Any]] {
+                // Flat (non-paginated) response — return all at once
+                allItems.append(contentsOf: arr.compactMap { ModelItem(json: $0) })
+                break
+            } else {
+                break
+            }
+        }
+        return allItems
     }
 
     /// GET /api/v1/models — ALL models for admin (includes base/provider models + workspace models)
@@ -2687,32 +2957,10 @@ final class APIClient: @unchecked Sendable {
     /// GET /api/v1/functions/id/{id}/valves/spec — with insertion-order key preservation
     func getFunctionValvesSpecOrdered(id: String) async throws -> ([String: Any], [String]) {
         let (data, _) = try await network.requestRaw(path: "/api/v1/functions/id/\(id)/valves/spec")
-        guard !data.isEmpty,
-              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return ([:], [])
-        }
-        // Extract key order from raw JSON
-        var orderedKeys: [String] = []
-        if let propsData = (json["properties"] as? [String: Any]) {
-            // Try to extract order from raw bytes
-            if let rawStr = String(data: data, encoding: .utf8),
-               let propsRange = rawStr.range(of: "\"properties\"") {
-                let afterProps = rawStr[propsRange.upperBound...]
-                let pattern = try? NSRegularExpression(pattern: "\"([^\"]+)\"\\s*:", options: [])
-                let nsRange = NSRange(afterProps.startIndex..<afterProps.endIndex, in: rawStr)
-                if let matches = pattern?.matches(in: String(rawStr), options: [], range: nsRange) {
-                    for match in matches {
-                        if let keyRange = Range(match.range(at: 1), in: rawStr) {
-                            let key = String(rawStr[keyRange])
-                            if propsData[key] != nil && !orderedKeys.contains(key) {
-                                orderedKeys.append(key)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return (json, orderedKeys)
+        guard !data.isEmpty else { return ([:], []) }
+        let spec = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        let keyOrder = extractPropertyKeyOrder(from: data)
+        return (spec, keyOrder)
     }
 
     /// POST /api/v1/functions/id/{id}/valves/update — saves valve overrides
@@ -2724,8 +2972,8 @@ final class APIClient: @unchecked Sendable {
             body: try JSONSerialization.data(withJSONObject: values)
         )
         guard !data.isEmpty,
-              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return values
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
         }
         return json
     }
@@ -2761,7 +3009,7 @@ final class APIClient: @unchecked Sendable {
         )
         guard !data.isEmpty,
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return values
+            return [:]
         }
         return json
     }
@@ -3214,6 +3462,14 @@ final class APIClient: @unchecked Sendable {
         )
     }
 
+    /// Revokes all shared chat links for the current user in one call.
+    func unshareAllConversations() async throws {
+        try await network.requestVoid(
+            path: "/api/v1/chats/share/all",
+            method: .delete
+        )
+    }
+
     /// Fetches a shared chat by its share ID.
     /// Used to display the read-only shared chat view in-app.
     func getSharedConversation(shareId: String) async throws -> Conversation {
@@ -3275,15 +3531,17 @@ final class APIClient: @unchecked Sendable {
         return try JSONDecoder().decode(Automation.self, from: data)
     }
 
-    func createAutomation(name: String, prompt: String, modelId: String, rrule: String) async throws -> Automation {
-        let bodyDict: [String: Any] = [
-            "name": name,
-            "data": [
-                "prompt": prompt,
-                "model_id": modelId,
-                "rrule": rrule
-            ] as [String: Any]
+    func createAutomation(name: String, prompt: String, modelId: String, rrule: String, channelId: String? = nil) async throws -> Automation {
+        var dataDict: [String: Any] = [
+            "prompt": prompt,
+            "model_id": modelId,
+            "rrule": rrule
         ]
+        // The server expects a nested `target` object: {type: "channel", channel_id: "..."}
+        if let channelId, !channelId.isEmpty {
+            dataDict["target"] = ["type": "channel", "channel_id": channelId] as [String: Any]
+        }
+        let bodyDict: [String: Any] = ["name": name, "data": dataDict]
         let bodyData = try JSONSerialization.data(withJSONObject: bodyDict)
         let (data, _) = try await network.requestRaw(
             path: "/api/v1/automations/create",
@@ -3345,6 +3603,36 @@ final class APIClient: @unchecked Sendable {
         )
     }
 
+    // MARK: - Tool Call Resolution (Human-in-the-Loop / Ask User)
+
+    /// Resolves a pending tool call (function_call item in a message's output array).
+    /// Used for:
+    ///   - Human-in-the-Loop approval: `action: "approve"` or `"reject"`
+    ///   - Ask User question cards:    `action: "answer"` with `answers` dict
+    ///
+    /// `POST /api/v1/chats/{chatId}/messages/{messageId}/resolve`
+    /// Body: `{ "call_id": "...", "action": "approve"|"reject"|"answer", "answers": {...}, "timed_out": bool }`
+    @discardableResult
+    func resolveChatMessageToolCall(
+        chatId: String,
+        messageId: String,
+        callId: String,
+        action: String,   // "approve" | "reject" | "answer"
+        answers: [String: Any]? = nil,
+        timedOut: Bool = false
+    ) async throws -> [String: Any] {
+        var body: [String: Any] = ["call_id": callId, "action": action]
+        if let answers { body["answers"] = answers }
+        if timedOut { body["timed_out"] = true }
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/chats/\(chatId)/messages/\(messageId)/resolve",
+            method: .post,
+            body: bodyData
+        )
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
     // MARK: - Calendars
 
     func getCalendars() async throws -> [OWCalendar] {
@@ -3400,19 +3688,29 @@ final class APIClient: @unchecked Sendable {
         return []
     }
 
-    func addMemory(content: String) async throws -> [String: Any] {
-        try await network.requestJSON(
+    /// Add a new memory. `type` is `"user"` (durable facts about the user) or `"context"`
+    /// (other durable context). Defaults to `"user"` to match the web UI default and ensure
+    /// the memory is surfaced in the priority `[User Memory]` section of the injected context.
+    func addMemory(content: String, type: String = "user", path: String? = nil) async throws -> [String: Any] {
+        var body: [String: Any] = ["content": content, "type": type]
+        if let path, !path.isEmpty { body["path"] = path }
+        return try await network.requestJSON(
             path: "/api/v1/memories/add",
             method: .post,
-            body: ["content": content]
+            body: body
         )
     }
 
-    func updateMemory(id: String, content: String) async throws -> [String: Any] {
-        try await network.requestJSON(
+    /// Update an existing memory. Pass `nil` for fields you don't want to change.
+    func updateMemory(id: String, content: String? = nil, type: String? = nil, path: String? = nil) async throws -> [String: Any] {
+        var body: [String: Any] = [:]
+        if let content { body["content"] = content }
+        if let type { body["type"] = type }
+        if let path { body["path"] = path }
+        return try await network.requestJSON(
             path: "/api/v1/memories/\(id)/update",
             method: .post,
-            body: ["content": content]
+            body: body
         )
     }
 
@@ -3428,6 +3726,53 @@ final class APIClient: @unchecked Sendable {
             path: "/api/v1/memories/delete/user",
             method: .delete
         )
+    }
+
+    /// Rebuild the vector embeddings for all user memories.
+    /// Useful when the vector DB gets out of sync with the relational store.
+    func resetMemoryEmbeddings() async throws -> Bool {
+        let json = try await network.requestJSON(
+            path: "/api/v1/memories/reset",
+            method: .post,
+            body: [String: Any]()
+        )
+        return json["result"] as? Bool ?? true
+    }
+
+    /// Semantic vector search over memories. Returns the top-k most relevant results
+    /// for the given query string.
+    func queryMemory(content: String, k: Int = 8) async throws -> [String: Any] {
+        try await network.requestJSON(
+            path: "/api/v1/memories/query",
+            method: .post,
+            body: ["content": content, "k": k]
+        )
+    }
+
+    /// Batch apply memory operations: `add`, `replace`, `remove`, `move`.
+    /// `source` is `"tool"` or `"background_review"` (defaults to `"tool"`).
+    func updateMemories(operations: [[String: Any]], source: String? = nil) async throws -> [[String: Any]] {
+        var body: [String: Any] = ["operations": operations]
+        if let source { body["source"] = source }
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/memories/update",
+            method: .post,
+            body: try JSONSerialization.data(withJSONObject: body)
+        )
+        return (try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]) ?? []
+    }
+
+    /// Server-side text search over memories with optional type/path filtering.
+    func searchMemories(query: String? = nil, type: String = "all", path: String? = nil, limit: Int = 20) async throws -> [[String: Any]] {
+        var body: [String: Any] = ["type": type, "limit": limit]
+        if let query, !query.isEmpty { body["query"] = query }
+        if let path, !path.isEmpty { body["path"] = path }
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/memories/search",
+            method: .post,
+            body: try JSONSerialization.data(withJSONObject: body)
+        )
+        return (try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]) ?? []
     }
 
     // MARK: - Title Generation
@@ -3450,7 +3795,14 @@ final class APIClient: @unchecked Sendable {
         )
 
         if let title = json["title"] as? String, !title.isEmpty {
-            return title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("{"),
+               let jsonData = trimmed.data(using: .utf8),
+               let parsed = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+               let parsedTitle = parsed["title"] as? String, !parsedTitle.isEmpty {
+                return parsedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return trimmed
         }
         if let choices = json["choices"] as? [[String: Any]],
            let first = choices.first,
@@ -3618,13 +3970,21 @@ final class APIClient: @unchecked Sendable {
 
     // MARK: - Private Helpers
 
-    private func parseModelArray(_ models: [[String: Any]]) -> [AIModel] {
+    /// - Parameter includeHidden: When `true`, models with `info.meta.hidden == true` are
+    ///   included in the result. Use this for the workspace model editor base model picker,
+    ///   where admins need to see all enabled models. Defaults to `false` (chat picker behaviour).
+    private func parseModelArray(_ models: [[String: Any]], includeHidden: Bool = false) -> [AIModel] {
         return models.compactMap { raw -> AIModel? in
             guard let id = raw["id"] as? String else { return nil }
             let name = raw["name"] as? String ?? id
 
-            // Skip models hidden by the admin (info.meta.hidden == true)
-            if let info = raw["info"] as? [String: Any],
+            // Skip models hidden by the admin (info.meta.hidden == true) —
+            // hidden models are not shown in the chat model picker for any user,
+            // matching OpenWebUI web behaviour (Selector.svelte filters them for everyone).
+            // Exception: the workspace model editor passes includeHidden: true so admins
+            // can select any enabled model as a base model (mirrors ModelEditor.svelte).
+            if !includeHidden,
+               let info = raw["info"] as? [String: Any],
                let meta = info["meta"] as? [String: Any],
                meta["hidden"] as? Bool == true {
                 return nil
@@ -3866,6 +4226,22 @@ final class APIClient: @unchecked Sendable {
             return ChatTask(id: taskId, content: content, status: status)
         } ?? []
 
+        // Parse top-level chat.files array — mirrors OWUI `chatFiles = chat?.files ?? []`.
+        // This is the persistent file list attached to the conversation, distinct from
+        // per-message files stored inside history nodes.
+        var chatFiles: [ChatMessageFile] = []
+        if let chat = json["chat"] as? [String: Any],
+           let rawFiles = chat["files"] as? [[String: Any]] {
+            chatFiles = rawFiles.compactMap { fileDict in
+                ChatMessageFile(
+                    type: fileDict["type"] as? String,
+                    url: fileDict["url"] as? String ?? fileDict["id"] as? String,
+                    name: fileDict["name"] as? String,
+                    contentType: fileDict["content_type"] as? String
+                )
+            }
+        }
+
         var conv = Conversation(
             id: id,
             title: title,
@@ -3880,7 +4256,8 @@ final class APIClient: @unchecked Sendable {
             shareId: shareId,
             folderId: folderId,
             tags: tags,
-            tasks: tasks
+            tasks: tasks,
+            files: chatFiles
         )
         conv.chatParams = chatParams
         return conv
@@ -4178,6 +4555,12 @@ final class APIClient: @unchecked Sendable {
 
         let model = msg["model"] as? String ?? msg["modelName"] as? String
         let attachmentIds = msg["attachment_ids"] as? [String] ?? []
+        // Server's `done` flag on the message — indicates generation has finished.
+        // Absent/true means done (not streaming); explicit false means still in-progress.
+        // This must be threaded into `isStreaming` below so callers (e.g. the streaming
+        // recovery poll) can reliably detect an in-progress response instead of always
+        // seeing `isStreaming == false` regardless of server state.
+        let msgDone = msg["done"] as? Bool ?? true
 
         var error: ChatMessageError?
         if let errObj = msg["error"] as? [String: Any] {
@@ -4311,6 +4694,7 @@ final class APIClient: @unchecked Sendable {
             content: content,
             timestamp: timestamp,
             model: model,
+            isStreaming: !msgDone,
             attachmentIds: attachmentIds,
             files: files,
             sources: sources,
@@ -4558,26 +4942,6 @@ final class APIClient: @unchecked Sendable {
     func getTaskConfig() async throws -> TaskConfig {
         let json = try await network.requestJSON(path: "/api/v1/tasks/config")
         return TaskConfig(from: json)
-    }
-
-    /// Checks which of the given chat IDs have active (in-progress) tasks on the server.
-    func checkActiveChats(chatIds: [String]) async throws -> Set<String> {
-        guard !chatIds.isEmpty else { return [] }
-        let json = try await network.requestJSON(
-            path: "/api/v1/tasks/active/chats",
-            method: .post,
-            body: ["chat_ids": chatIds]
-        )
-        if let activeIds = json["chat_ids"] as? [String] {
-            return Set(activeIds)
-        }
-        var active = Set<String>()
-        for (key, value) in json {
-            if let isActive = value as? Bool, isActive {
-                active.insert(key)
-            }
-        }
-        return active
     }
 
     func generateAutocompletion(
@@ -5050,17 +5414,22 @@ final class APIClient: @unchecked Sendable {
     }
 
     /// Posts a new message to a channel.
+    /// Sends a `temp_id` so the server can include it in the socket broadcast,
+    /// allowing the client to match the confirmed message to its optimistic placeholder
+    /// by ID instead of falling back to content+userId dedup.
     func postChannelMessage(
         channelId: String,
         content: String,
         replyToId: String? = nil,
         parentId: String? = nil,
-        data msgData: [String: Any]? = nil
+        data msgData: [String: Any]? = nil,
+        tempId: String? = nil
     ) async throws -> ChannelMessage? {
         var body: [String: Any] = ["content": content]
         if let replyToId { body["reply_to_id"] = replyToId }
         if let parentId { body["parent_id"] = parentId }
         if let msgData { body["data"] = msgData }
+        if let tempId { body["temp_id"] = tempId }
 
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         let (data, _) = try await network.requestRaw(
@@ -5327,6 +5696,36 @@ final class APIClient: @unchecked Sendable {
         return []
     }
 
+    // MARK: - Evaluations / Feedback
+
+    /// Paginated list of feedback records.
+    /// GET `/api/v1/evaluations/feedbacks/list?order_by=updated_at&direction=desc&page=N&limit=N`
+    func listFeedbacks(
+        page: Int = 1,
+        limit: Int = 20,
+        orderBy: String = "updated_at",
+        direction: String = "desc"
+    ) async throws -> FeedbackListResponse {
+        let queryItems: [URLQueryItem] = [
+            URLQueryItem(name: "order_by", value: orderBy),
+            URLQueryItem(name: "direction", value: direction),
+            URLQueryItem(name: "page", value: "\(page)"),
+            URLQueryItem(name: "limit", value: "\(limit)")
+        ]
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/evaluations/feedbacks/list",
+            queryItems: queryItems
+        )
+        return try JSONDecoder().decode(FeedbackListResponse.self, from: data)
+    }
+
+    /// Fetch a single feedback record with full snapshot.
+    /// GET `/api/v1/evaluations/feedback/{id}`
+    func getFeedback(id: String) async throws -> FeedbackItem {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/evaluations/feedback/\(id)")
+        return try JSONDecoder().decode(FeedbackItem.self, from: data)
+    }
+
     // MARK: - Admin General Settings
 
     /// GET `/api/v1/auths/admin/config` — fetch full auth/general config.
@@ -5355,6 +5754,48 @@ final class APIClient: @unchecked Sendable {
     }
 
     /// GET `/api/v1/auths/admin/config/ldap` — fetch LDAP enable toggle.
+    /// GET `/api/v1/auths/admin/config/oauth` — fetch OAuth/OIDC configuration.
+    func getAdminOAuthConfig() async throws -> AdminOAuthConfig {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/auths/admin/config/oauth")
+        let decoder = JSONDecoder()
+        return try decoder.decode(AdminOAuthConfig.self, from: data)
+    }
+
+    /// POST `/api/v1/auths/admin/config/oauth` — update OAuth/OIDC configuration.
+    @discardableResult
+    func updateAdminOAuthConfig(_ config: AdminOAuthConfig) async throws -> AdminOAuthConfig {
+        let bodyData = try JSONEncoder().encode(config)
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/auths/admin/config/oauth",
+            method: .post,
+            body: bodyData,
+            contentType: "application/json"
+        )
+        let decoder = JSONDecoder()
+        return try decoder.decode(AdminOAuthConfig.self, from: data)
+    }
+
+    /// GET `/api/v1/chats/config` — fetch chat config (context compaction, etc.)
+    func getAdminChatConfig() async throws -> AdminChatConfig {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/chats/config")
+        let decoder = JSONDecoder()
+        return try decoder.decode(AdminChatConfig.self, from: data)
+    }
+
+    /// POST `/api/v1/chats/config` — update chat config.
+    @discardableResult
+    func updateAdminChatConfig(_ config: AdminChatConfig) async throws -> AdminChatConfig {
+        let bodyData = try JSONEncoder().encode(config)
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/chats/config",
+            method: .post,
+            body: bodyData,
+            contentType: "application/json"
+        )
+        let decoder = JSONDecoder()
+        return try decoder.decode(AdminChatConfig.self, from: data)
+    }
+
     func getAdminLdapConfig() async throws -> AdminLdapConfig {
         try await network.request(AdminLdapConfig.self, path: "/api/v1/auths/admin/config/ldap")
     }
@@ -5923,6 +6364,308 @@ final class APIClient: @unchecked Sendable {
     func getGroups() async throws -> [GroupResponse] {
         let (data, _) = try await network.requestRaw(path: "/api/v1/groups/")
         return try JSONDecoder().decode([GroupResponse].self, from: data)
+    }
+
+    // MARK: - Model-Switch Status (issue #79)
+
+    /// Fetches the model-switch status from an absolute URL configured per-server.
+    /// The URL is NOT relative to the OpenWebUI base URL — it points directly at the
+    /// SGLang proxy or similar service (e.g. `http://192.168.1.10:8091/v1/switch/status`).
+    /// Returns `nil` on any network or decoding error so the caller can treat it as
+    /// "no switch in progress" gracefully.
+    func fetchModelSwitchStatus(url: String) async -> ModelSwitchStatus? {
+        guard let endpoint = URL(string: url) else { return nil }
+        var request = URLRequest(url: endpoint)
+        request.timeoutInterval = 5
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            let decoder = JSONDecoder()
+            return try decoder.decode(ModelSwitchStatus.self, from: data)
+        } catch {
+            return nil
+        }
+    }
+
+    // MARK: - Evaluations (Feedback)
+
+    /// POST /api/v1/evaluations/feedback — creates a new feedback record.
+    /// Returns the feedback dict including the server-assigned `id`.
+    func createFeedback(type: String, data: [String: Any], meta: [String: Any], snapshot: [String: Any]) async throws -> [String: Any] {
+        let body: [String: Any] = ["type": type, "data": data, "meta": meta, "snapshot": snapshot]
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        let (responseData, _) = try await network.requestRaw(
+            path: "/api/v1/evaluations/feedback",
+            method: .post, body: bodyData, contentType: "application/json")
+        return (try? JSONSerialization.jsonObject(with: responseData) as? [String: Any]) ?? [:]
+    }
+
+    /// POST /api/v1/evaluations/feedback/{id} — updates an existing feedback record.
+    func updateFeedback(id: String, type: String, data: [String: Any], meta: [String: Any], snapshot: [String: Any]) async throws {
+        let body: [String: Any] = ["type": type, "data": data, "meta": meta, "snapshot": snapshot]
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        _ = try await network.requestRaw(
+            path: "/api/v1/evaluations/feedback/\(id)",
+            method: .post, body: bodyData, contentType: "application/json")
+    }
+
+    /// DELETE `/api/v1/evaluations/feedback/{id}` — permanently removes a feedback record.
+    func deleteFeedback(id: String) async throws {
+        _ = try await network.requestRaw(
+            path: "/api/v1/evaluations/feedback/\(id)",
+            method: .delete)
+    }
+
+    /// POST /api/v1/tasks/tags/completions — AI-generates tag suggestions for a message.
+    /// Returns an array of tag strings.
+    func getTagSuggestions(model: String, messages: [[String: Any]], chatId: String) async throws -> [String] {
+        let body: [String: Any] = ["model": model, "messages": messages, "chat_id": chatId]
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        let (responseData, _) = try await network.requestRaw(
+            path: "/api/v1/tasks/tags/completions",
+            method: .post, body: bodyData, contentType: "application/json")
+        if let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+           let tags = json["tags"] as? [String] { return tags }
+        return []
+    }
+
+    // MARK: - Notification Targets (v0.11.0)
+
+    /// GET /api/v1/notifications/events — list supported notification event types.
+    func getNotificationEvents() async throws -> [NotificationEvent] {
+        try await network.request([NotificationEvent].self, path: "/api/v1/notifications/events")
+    }
+
+    /// GET /api/v1/notifications/targets — list all notification targets.
+    func getNotificationTargets() async throws -> [NotificationTarget] {
+        try await network.request([NotificationTarget].self, path: "/api/v1/notifications/targets")
+    }
+
+    /// POST /api/v1/notifications/targets — create a new notification target.
+    func createNotificationTarget(_ form: NotificationTargetForm) async throws -> NotificationTarget {
+        let body = try JSONEncoder().encode(form)
+        let (data, _) = try await network.requestRaw(path: "/api/v1/notifications/targets", method: .post, body: body)
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(NotificationTarget.self, from: data)
+    }
+
+    /// PUT /api/v1/notifications/targets/{id} — update an existing notification target.
+    func updateNotificationTarget(id: String, form: NotificationTargetForm) async throws -> NotificationTarget {
+        let body = try JSONEncoder().encode(form)
+        let (data, _) = try await network.requestRaw(path: "/api/v1/notifications/targets/\(id)", method: .put, body: body)
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(NotificationTarget.self, from: data)
+    }
+
+    /// DELETE /api/v1/notifications/targets/{id} — delete a notification target.
+    func deleteNotificationTarget(id: String) async throws {
+        _ = try await network.requestRaw(
+            path: "/api/v1/notifications/targets/\(id)",
+            method: .delete)
+    }
+
+    /// PUT /api/v1/notifications/targets/{id}/default — set a target as default.
+    func setDefaultNotificationTarget(id: String) async throws -> NotificationTarget {
+        try await network.requestVoidJSON(path: "/api/v1/notifications/targets/\(id)/default", method: .put, body: nil)
+        return try await network.request(NotificationTarget.self, path: "/api/v1/notifications/targets/\(id)")
+    }
+
+    /// POST /api/v1/notifications/targets/{id}/test — send a test notification.
+    func testNotificationTarget(id: String) async throws {
+        _ = try await network.requestRaw(
+            path: "/api/v1/notifications/targets/\(id)/test",
+            method: .post)
+    }
+
+    // MARK: - Sub-agents Config (v0.11.0)
+
+    /// GET /api/v1/configs/subagents — retrieve sub-agents configuration.
+    /// Uses a plain JSONDecoder (no .convertFromSnakeCase) so SCREAMING_SNAKE_CASE CodingKeys
+    /// like "ENABLE_SUBAGENTS" are matched verbatim against the server response.
+    func getSubagentsConfig() async throws -> SubagentsConfig {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/configs/subagents")
+        return (try? JSONDecoder().decode(SubagentsConfig.self, from: data)) ?? SubagentsConfig()
+    }
+
+    /// POST /api/v1/configs/subagents — save sub-agents configuration.
+    /// Decodes the POST response directly with a plain JSONDecoder to match SCREAMING_SNAKE_CASE keys.
+    func setSubagentsConfig(_ config: SubagentsConfig) async throws -> SubagentsConfig {
+        let body = try JSONEncoder().encode(config)
+        let (data, _) = try await network.requestRaw(path: "/api/v1/configs/subagents", method: .post, body: body)
+        return (try? JSONDecoder().decode(SubagentsConfig.self, from: data)) ?? config
+    }
+
+    // MARK: - Database / Config Import-Export
+
+    /// GET /api/v1/configs/export — download the full admin config as JSON.
+    func exportAdminConfig() async throws -> Data {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/configs/export")
+        return data
+    }
+
+    /// POST /api/v1/configs/import — restore admin config from JSON.
+    func importAdminConfig(_ data: Data) async throws {
+        _ = try await network.requestRaw(path: "/api/v1/configs/import", method: .post, body: data)
+    }
+
+    /// GET /api/v1/chats/stats/export — download all user chats as JSON.
+    func exportAllChats() async throws -> Data {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/chats/stats/export")
+        return data
+    }
+
+    // MARK: - Pipelines
+
+    /// GET /api/v1/pipelines/list — returns array of {idx, url} pipeline server entries.
+    func getPipelinesList() async throws -> [[String: Any]] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/pipelines/list")
+        guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        return arr
+    }
+
+    /// GET /api/v1/pipelines/?url_idx=N — returns pipelines installed on a specific server.
+    func getPipelines(urlIdx: Int) async throws -> [[String: Any]] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/pipelines/?url_idx=\(urlIdx)")
+        guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        return arr
+    }
+
+    /// POST /api/v1/pipelines/add — install a pipeline from a GitHub raw URL.
+    func downloadPipeline(url: String, urlIdx: Int) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["url": url, "url_idx": urlIdx])
+        _ = try await network.requestRaw(path: "/api/v1/pipelines/add", method: .post, body: body)
+    }
+
+    /// DELETE /api/v1/pipelines/delete — remove an installed pipeline.
+    func deletePipeline(id: String, urlIdx: Int) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["id": id, "url_idx": urlIdx])
+        _ = try await network.requestRaw(path: "/api/v1/pipelines/delete", method: .delete, body: body)
+    }
+
+    /// GET /api/v1/pipelines/{id}/valves?url_idx=N
+    func getPipelineValves(id: String, urlIdx: Int) async throws -> [String: Any] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/pipelines/\(id)/valves?url_idx=\(urlIdx)")
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// GET /api/v1/pipelines/{id}/valves/spec?url_idx=N
+    func getPipelineValvesSpec(id: String, urlIdx: Int) async throws -> [String: Any] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/pipelines/\(id)/valves/spec?url_idx=\(urlIdx)")
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// POST /api/v1/pipelines/{id}/valves/update
+    func updatePipelineValves(id: String, urlIdx: Int, valves: [String: Any]) async throws {
+        var payload = valves
+        payload["url_idx"] = urlIdx
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        _ = try await network.requestRaw(path: "/api/v1/pipelines/\(id)/valves/update", method: .post, body: body)
+    }
+
+    // MARK: - Event Webhooks
+
+    /// GET /api/events — returns list of available event catalog items.
+    func getEventCatalog() async throws -> [[String: Any]] {
+        let (data, _) = try await network.requestRaw(path: "/api/events")
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let events = json["events"] as? [[String: Any]] else { return [] }
+        return events
+    }
+
+    /// GET /api/events/webhooks — returns list of event webhooks.
+    func getEventWebhooks() async throws -> [[String: Any]] {
+        let (data, _) = try await network.requestRaw(path: "/api/events/webhooks")
+        guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        return arr
+    }
+
+    /// POST /api/events/webhooks — create a new event webhook.
+    func createEventWebhook(_ payload: [String: Any]) async throws -> [String: Any] {
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let (data, _) = try await network.requestRaw(path: "/api/events/webhooks", method: .post, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// PUT /api/events/webhooks/{id} — update an existing event webhook.
+    func updateEventWebhook(id: String, _ payload: [String: Any]) async throws -> [String: Any] {
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let (data, _) = try await network.requestRaw(path: "/api/events/webhooks/\(id)", method: .put, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// DELETE /api/events/webhooks/{id} — delete an event webhook.
+    func deleteEventWebhook(id: String) async throws {
+        _ = try await network.requestRaw(path: "/api/events/webhooks/\(id)", method: .delete)
+    }
+
+    // MARK: - External Knowledge Connections
+
+    /// GET /api/v1/knowledge/external/connections
+    func getExternalKnowledgeConnections() async throws -> [[String: Any]] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/knowledge/external/connections")
+        // Response: {"items": [...]}
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let items = json["items"] as? [[String: Any]] { return items }
+        return (try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]) ?? []
+    }
+
+    /// PATCH /api/v1/knowledge/external/connections/{id} — toggle enabled state.
+    func updateExternalKnowledgeConnection(id: String, _ payload: [String: Any]) async throws {
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        _ = try await network.requestRaw(path: "/api/v1/knowledge/external/connections/\(id)", method: .patch, body: body)
+    }
+
+    /// DELETE /api/v1/knowledge/external/connections/{id}
+    func deleteExternalKnowledgeConnection(id: String) async throws {
+        _ = try await network.requestRaw(path: "/api/v1/knowledge/external/connections/\(id)", method: .delete)
+    }
+
+    /// POST /api/v1/knowledge/external/source/test — test connection before creating.
+    func testExternalKnowledgeSource(_ payload: [String: Any]) async throws -> [String: Any] {
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let (data, _) = try await network.requestRaw(path: "/api/v1/knowledge/external/source/test", method: .post, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// POST /api/v1/knowledge/external/source/create — create external knowledge source.
+    func createExternalKnowledgeSource(_ payload: [String: Any]) async throws -> [String: Any] {
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let (data, _) = try await network.requestRaw(path: "/api/v1/knowledge/external/source/create", method: .post, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// PATCH /api/v1/knowledge/external/source/{id} — update external knowledge source.
+    func updateExternalKnowledgeSource(id: String, _ payload: [String: Any]) async throws -> [String: Any] {
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let (data, _) = try await network.requestRaw(path: "/api/v1/knowledge/external/source/\(id)", method: .patch, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// GET /api/v1/knowledge/search?source=external — fetch external knowledge items.
+    /// Uses the search endpoint with source=external filter, matching the web UI's
+    /// `searchKnowledgeBases(token, null, null, 1, 'external')` call.
+    func getExternalKnowledgeItems() async throws -> [[String: Any]] {
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/knowledge/search",
+            queryItems: [URLQueryItem(name: "source", value: "external")]
+        )
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let items = json["items"] as? [[String: Any]] { return items }
+        return (try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]) ?? []
+    }
+
+    // MARK: - User Chat Variables (v0.11.0)
+
+    /// GET /api/v1/users/user/variables — fetch the current user's chat variables.
+    func getUserVariables() async throws -> UserVariables {
+        (try? await network.request(UserVariables.self, path: "/api/v1/users/user/variables")) ?? UserVariables()
+    }
+
+    /// POST /api/v1/users/user/variables/update — save the current user's chat variables.
+    func updateUserVariables(_ variables: [String: String]) async throws -> UserVariables {
+        let bodyData = try JSONSerialization.data(withJSONObject: variables)
+        _ = try await network.requestRaw(path: "/api/v1/users/user/variables/update", method: .post, body: bodyData)
+        return (try? await network.request(UserVariables.self, path: "/api/v1/users/user/variables")) ?? UserVariables(variables: variables)
     }
 }
 

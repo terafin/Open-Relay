@@ -6,6 +6,140 @@ import MarkdownView
 
 private let vizLog = Logger(subsystem: "com.openui", category: "VizPipeline")
 
+// MARK: - Global Off-Main Parse Cache
+
+/// Process-lifetime, content-keyed cache for `ToolCallParser.parseOrdered` results.
+///
+/// ## Why global instead of per-instance @State
+/// Each `AssistantMessageContent` view instance carries its own `@State parseCache`
+/// which is destroyed when the sliding window recycles the row. Re-visiting a
+/// scrolled-away row forces a full re-parse on the main thread (the hot path for
+/// 80k-token chats). This actor replaces that per-instance cache with a single
+/// process-wide store keyed by a content hash, so the parse result is available
+/// instantly even after the row has been recycled and re-mounted.
+///
+/// ## Thread safety
+/// All writes and reads happen on a dedicated background executor (actor isolation).
+/// `AssistantMessageContent.body` reads the cache synchronously via a nonisolated
+/// helper that checks an `NSCache` (itself thread-safe), then fires an async Task on
+/// a background priority queue for cache misses.
+///
+/// ## Memory
+/// `NSCache` automatically evicts entries under memory pressure, so we never need
+/// to size this manually. Each entry is ~few KB (the parsed segment graph).
+actor MessageParseCache {
+    static let shared = MessageParseCache()
+
+    /// Lightweight value cached per content string.
+    struct Entry {
+        let result: ToolCallParser.OrderedParseResult
+        /// utf8 byte count of the content that produced this entry — used
+        /// as a fast pre-check before an O(N) equality test.
+        let byteCount: Int
+        /// The exact content string so we can detect hash collisions.
+        let content: String
+    }
+
+    // NSCache is thread-safe and auto-evicts under memory pressure.
+    // We wrap it in the actor so all mutations go through the actor's executor,
+    // but the *read* path below (via `lookup`) is also actor-isolated.
+    // `nonisolated(unsafe)` lets the synchronous `lookupSync` helper read
+    // this property without hopping to the actor executor — safe because
+    // NSCache's own locking guarantees atomicity for object reads/writes.
+    nonisolated(unsafe) private let cache = NSCache<NSString, NSObject>()
+
+    init() {
+        // Allow ~200 entries (typical chat has far fewer assistant messages).
+        cache.countLimit = 200
+    }
+
+    // MARK: - Actor-isolated interface
+
+    /// Returns a cached entry for `content` if present, otherwise `nil`.
+    func lookup(content: String) -> ToolCallParser.OrderedParseResult? {
+        let key = cacheKey(content)
+        guard let obj = cache.object(forKey: key as NSString) as? EntryBox else { return nil }
+        // Guard against hash collisions: verify exact content match.
+        guard obj.entry.content == content else { return nil }
+        return obj.entry.result
+    }
+
+    // MARK: - Nonisolated synchronous read (for SwiftUI body)
+
+    /// Synchronous, non-actor-isolated cache lookup for use inside SwiftUI `body`.
+    ///
+    /// `NSCache` is internally thread-safe, so we can read it from any context
+    /// without hopping to the actor's executor. This avoids the `await` that
+    /// would be required for an actor-isolated call, which cannot be used in a
+    /// synchronous `body` function.
+    ///
+    /// The trade-off: we bypass actor isolation for the *read* path only.
+    /// Writes still go through `parseAndStore` (actor-isolated) which serialises
+    /// all mutations. A concurrent read of a partially-written entry is impossible
+    /// because `NSCache.setObject` is atomic and `EntryBox` is immutable after
+    /// construction — once visible, it is fully formed.
+    nonisolated func lookupSync(_ content: String) -> ToolCallParser.OrderedParseResult? {
+        let byteCount = content.utf8.count
+        let prefix = content.prefix(64)
+        let key = "\(byteCount)-\(prefix.hashValue)"
+        guard let obj = cache.object(forKey: key as NSString) as? EntryBox else { return nil }
+        guard obj.entry.content == content else { return nil }
+        return obj.entry.result
+    }
+
+    /// Parses `content` (off the main thread, inside the actor) and stores the result.
+    /// Returns the result so callers can chain without a second lookup.
+    @discardableResult
+    func parseAndStore(content: String) -> ToolCallParser.OrderedParseResult {
+        // Check again — another Task may have already done this.
+        let key = cacheKey(content)
+        if let existing = cache.object(forKey: key as NSString) as? EntryBox,
+           existing.entry.content == content {
+            return existing.entry.result
+        }
+        let result = ToolCallParser.parseOrdered(content)
+        let entry = Entry(result: result, byteCount: content.utf8.count, content: content)
+        cache.setObject(EntryBox(entry), forKey: key as NSString)
+        return result
+    }
+
+    /// Warms the cache for all provided content strings concurrently.
+    /// Safe to call from background tasks — actor isolation handles serialisation.
+    func warmBatch(_ contents: [String]) async {
+        for (i, content) in contents.enumerated() {
+            // Skip already-cached entries to avoid re-work.
+            let key = cacheKey(content)
+            if let existing = cache.object(forKey: key as NSString) as? EntryBox,
+               existing.entry.content == content {
+                continue
+            }
+            let result = ToolCallParser.parseOrdered(content)
+            let entry = Entry(result: result, byteCount: content.utf8.count, content: content)
+            cache.setObject(EntryBox(entry), forKey: key as NSString)
+            // Yield to the cooperative thread pool every 4 items so the actor
+            // doesn't monopolise a thread and starve the main-thread render loop.
+            if i % 4 == 3 { await Task.yield() }
+        }
+    }
+
+    // MARK: - Helpers
+
+    /// Fast O(1) cache key: use the content's utf8 count XORed with the prefix
+    /// hash as a cheap discriminator. Collision probability over 200 entries is
+    /// negligible; the full-content guard in `lookup`/`parseAndStore` handles it.
+    private func cacheKey(_ content: String) -> String {
+        let byteCount = content.utf8.count
+        let prefix = content.prefix(64)
+        return "\(byteCount)-\(prefix.hashValue)"
+    }
+
+    /// NSCache requires AnyObject values.
+    private final class EntryBox: NSObject {
+        let entry: Entry
+        init(_ entry: Entry) { self.entry = entry }
+    }
+}
+
 // MARK: - Tool Call Data
 
 /// Represents a parsed tool call extracted from `<details>` HTML blocks
@@ -16,6 +150,9 @@ struct ToolCallData: Identifiable {
     let arguments: String?
     let result: String?
     let isDone: Bool
+    /// The raw `status` attribute from the output item, e.g. `"pending"`, `"completed"`,
+    /// `"rejected"`, `"failed"`. `nil` for older content that has no status attribute.
+    let status: String?
     /// Rich UI HTML embeds returned by the tool. Each string is a full HTML
     /// document to be rendered inline in the chat as an interactive webview.
     let embeds: [String]
@@ -23,6 +160,31 @@ struct ToolCallData: Identifiable {
     /// A display-friendly name (replaces underscores with spaces).
     var displayName: String {
         name.replacingOccurrences(of: "_", with: " ")
+    }
+
+    /// True when this is an `ask_user` call awaiting the user's answers.
+    var needsUserInput: Bool {
+        name == "ask_user" && status == "pending"
+    }
+
+    /// Whether this tool call resulted in an error.
+    ///
+    /// OpenWebUI marks failed tool calls by embedding an error indicator in the result.
+    /// Checks for common patterns: top-level `"error"` JSON key, `Error:` prefix,
+    /// `"status": "error"`, or an explicit `"success": false` field.
+    var isError: Bool {
+        guard isDone, let result, !result.isEmpty else { return false }
+        // Fast string checks before attempting JSON parse
+        let lower = result.lowercased()
+        // JSON error key: {"error": ...} or {"error":...}
+        if lower.contains("\"error\"") { return true }
+        // Explicit error prefix from Python exceptions
+        if result.hasPrefix("Error:") || result.hasPrefix("error:") { return true }
+        // Status field
+        if lower.contains("\"status\": \"error\"") || lower.contains("\"status\":\"error\"") { return true }
+        // Explicit failure flag
+        if lower.contains("\"success\": false") || lower.contains("\"success\":false") { return true }
+        return false
     }
 }
 
@@ -42,7 +204,7 @@ struct ReasoningData: Identifiable {
     let duration: String?
     let isDone: Bool
 
-    init(summary: String, content: String, duration: String?, isDone: Bool) {
+    nonisolated init(summary: String, content: String, duration: String?, isDone: Bool) {
         // Use the first 80 characters as a stable anchor — the beginning of
         // a reasoning block is fixed once streaming starts (only the tail grows).
         let prefix = String(content.prefix(80))
@@ -90,7 +252,7 @@ enum ToolCallParser {
 
     /// Returns a cached (or freshly compiled) NSRegularExpression for `pattern`.
     /// Thread-safe via `os_unfair_lock` (non-recursive, no allocation).
-    static func cachedRegex(_ pattern: String, options: NSRegularExpression.Options = []) -> NSRegularExpression? {
+    nonisolated static func cachedRegex(_ pattern: String, options: NSRegularExpression.Options = []) -> NSRegularExpression? {
         let key = pattern + "\0\(options.rawValue)"
         os_unfair_lock_lock(&_regexCacheLock)
         if let cached = _regexCache[key] {
@@ -155,7 +317,7 @@ enum ToolCallParser {
     /// Parses the content into ordered segments preserving the original
     /// position of each `<details>` block relative to surrounding text.
     /// This is the core parser that all other methods delegate to.
-    static func parseOrdered(_ content: String) -> OrderedParseResult {
+    nonisolated static func parseOrdered(_ content: String) -> OrderedParseResult {
         // Pre-process: convert raw <think>…</think> tags (sent by models
         // like Qwen, DeepSeek, etc.) into <details type="reasoning"> blocks
         // so the state-machine tokenizer picks them up and renders them as
@@ -262,7 +424,7 @@ enum ToolCallParser {
     ///   found the closing `>` of the opening tag) but whose `</details>` has
     ///   not yet arrived. In that case the block is skipped and left as
     ///   surrounding text so that streaming does not flash partial content.
-    private static func findDetailsBlocks(in content: String) -> [DetailsMatch] {
+    private nonisolated static func findDetailsBlocks(in content: String) -> [DetailsMatch] {
         var results: [DetailsMatch] = []
         var i = content.startIndex
 
@@ -449,7 +611,7 @@ enum ToolCallParser {
     ///   embedding a raw closing tag (e.g. `</thinking>`, `</details>`) inside
     ///   the `<details type="reasoning">` block content, with the real response
     ///   following it before the outer `</details>`.
-    private static func parseReasoningBlock(_ block: String) -> (data: ReasoningData, spillover: String?)? {
+    private nonisolated static func parseReasoningBlock(_ block: String) -> (data: ReasoningData, spillover: String?)? {
         let doneStr = extractAttribute("done", from: block)
         let isDone = doneStr == "true"
         let duration = extractAttribute("duration", from: block)
@@ -545,11 +707,12 @@ enum ToolCallParser {
     }
 
     /// Parses a single tool call `<details>` block into a `ToolCallData`.
-    private static func parseToolCallBlock(_ block: String) -> ToolCallData? {
+    private nonisolated static func parseToolCallBlock(_ block: String) -> ToolCallData? {
         let name = extractAttribute("name", from: block) ?? "tool"
         let id = extractAttribute("id", from: block) ?? UUID().uuidString
         let doneStr = extractAttribute("done", from: block)
         let isDone = doneStr == "true"
+        let status = extractAttribute("status", from: block)
         let arguments = extractAttribute("arguments", from: block)
         // Try the result="" attribute first. If absent (OpenWebUI stores the output
         // as the body between </summary> and </details>), fall back to body content.
@@ -578,6 +741,7 @@ enum ToolCallParser {
             arguments: decodeHTMLEntities(arguments),
             result: decodeHTMLEntities(result),
             isDone: isDone,
+            status: status,
             embeds: embeds
         )
     }
@@ -593,7 +757,7 @@ enum ToolCallParser {
     /// Those are JSON escape sequences that must remain intact so JSONSerialization
     /// can parse the array correctly. Raw newlines inside JSON string values make
     /// the JSON invalid and cause parse failure.
-    private static func parseEmbedsAttribute(from block: String) -> [String] {
+    private nonisolated static func parseEmbedsAttribute(from block: String) -> [String] {
         guard let raw = extractAttribute("embeds", from: block),
               !raw.isEmpty else { return [] }
 
@@ -632,7 +796,7 @@ enum ToolCallParser {
 
     /// All tag pairs that OpenWebUI recognises by default for reasoning content.
     /// Order matters: more specific / longer tags first to avoid partial matches.
-    private static let defaultReasoningTagPairs: [(open: String, close: String)] = [
+    private nonisolated static let defaultReasoningTagPairs: [(open: String, close: String)] = [
         ("<|begin_of_thought|>", "<|end_of_thought|>"),
         ("◁think▷", "◁/think▷"),
         ("<thinking>", "</thinking>"),
@@ -666,7 +830,7 @@ enum ToolCallParser {
     /// 2. **Unclosed tag**: `<think>content` (mid-stream) → in-progress block
     /// 3. **Incomplete details block**: `<details type="reasoning"><summary>…` → in-progress block
     /// 4. **No matching tags**: content returned unchanged
-    private static func preprocessThinkTags(_ content: String) -> String {
+    private nonisolated static func preprocessThinkTags(_ content: String) -> String {
         var result = content
 
         // ── Phase 1: Convert raw model reasoning tags ──
@@ -829,12 +993,33 @@ enum ToolCallParser {
             if let incompleteRegex = cachedRegex(#"(<details\s+[^>]*type\s*=\s*["']reasoning["'][^>]*>)([\s\S]*)$"#,
                 options: [.dotMatchesLineSeparators]) {
                 let nsResult = result as NSString
-                // Only act if there's an opening <details> without a matching </details>
-                // We check by counting opens vs closes for reasoning details
+                // Only act if there's an unclosed reasoning block.
+                //
+                // BUG FIX: The old code compared openCount (reasoning opens) against
+                // closeCount (ALL </details> tags globally). In a sequence like:
+                //   reasoning_1(closed) + tool_calls(closed) + reasoning_2(in-flight)
+                // openCount=2, closeCount=2 (one from reasoning_1, one from tool_calls),
+                // so 2 > 2 == false and Phase 3 never fires — reasoning_2 stays as
+                // raw HTML forever, causing the pipeline freeze to never release.
+                //
+                // Fix: count only COMPLETED reasoning blocks (open+close pairs) and
+                // compare against total reasoning opens. This is immune to the number
+                // of tool_calls </details> tags in the string.
                 let openCount = countOccurrences(of: #"<details\s+[^>]*type\s*=\s*["']reasoning["']"#, in: result)
-                let closeCount = countOccurrences(of: "</details>", in: result)
+                let completedCount: Int
+                if let completedRegex = cachedRegex(
+                    #"<details\s+[^>]*type\s*=\s*["']reasoning["'][^>]*>[\s\S]*?</details>"#,
+                    options: [.dotMatchesLineSeparators]
+                ) {
+                    completedCount = completedRegex.numberOfMatches(
+                        in: result,
+                        range: NSRange(result.startIndex..., in: result)
+                    )
+                } else {
+                    completedCount = 0
+                }
 
-                if openCount > closeCount {
+                if openCount > completedCount {
                     // Find the LAST unclosed opening tag
                     let allMatches = incompleteRegex.matches(
                         in: result,
@@ -989,13 +1174,13 @@ enum ToolCallParser {
     }
 
     /// Counts regex occurrences in a string.
-    private static func countOccurrences(of pattern: String, in text: String) -> Int {
+    private nonisolated static func countOccurrences(of pattern: String, in text: String) -> Int {
         guard let regex = cachedRegex(pattern, options: [.dotMatchesLineSeparators]) else { return 0 }
         return regex.numberOfMatches(in: text, range: NSRange(location: 0, length: (text as NSString).length))
     }
 
     /// Extracts an HTML attribute value from a tag string.
-    private static func extractAttribute(_ name: String, from html: String) -> String? {
+    private nonisolated static func extractAttribute(_ name: String, from html: String) -> String? {
         // Match attribute="value" with double or single quotes
         let patterns = [
             name + #"\s*=\s*"([^"]*)""#,
@@ -1014,7 +1199,7 @@ enum ToolCallParser {
     }
 
     /// Decodes common HTML entities in attribute values.
-    private static func decodeHTMLEntities(_ string: String?) -> String? {
+    private nonisolated static func decodeHTMLEntities(_ string: String?) -> String? {
         guard let string, !string.isEmpty else { return string }
         return string
             .replacingOccurrences(of: "&quot;", with: "\"")
@@ -1024,8 +1209,6 @@ enum ToolCallParser {
             .replacingOccurrences(of: "&apos;", with: "'")
             .replacingOccurrences(of: "&#x27;", with: "'")
             .replacingOccurrences(of: "&#39;", with: "'")
-            .replacingOccurrences(of: "\\n", with: "\n")
-            .replacingOccurrences(of: "\\\"", with: "\"")
     }
 
     // MARK: - File ID Extraction from Tool Results
@@ -1502,26 +1685,20 @@ private struct RichUIWebView: UIViewRepresentable {
         webView.backgroundColor = .clear
 
         // ── Scroll / gesture setup ────────────────────────────────────────────
-        // Disable the scroll view entirely so it has NO gesture recognizers that
-        // compete with HTML interactive elements.
+        // Enable native scroll so 1-finger drag works inside the embed when its
+        // content is taller than the capped frame height (maxHeight = 600pt).
+        // When the content fits within the frame SwiftUI sizes the webview to its
+        // exact content height, so there is nothing to scroll and the gesture falls
+        // through naturally to the parent chat ScrollView — identical behaviour to
+        // StreamingWebPreview (HTML code block previews) which uses the same pattern.
         //
-        // Background: WKWebView's internal scroll view owns a UIScrollViewPanGestureRecognizer
-        // that has higher UIKit priority than WebKit's touch-handling. When the user
-        // drags an <input type="range"> slider, the pan recognizer fires first and
-        // claims the touch sequence — the slider thumb never moves.
-        //
-        // Setting isScrollEnabled = false removes the pan recognizer from the
-        // responder chain, giving touches directly to WebKit. The SwiftUI .frame()
-        // already constrains the webview height to content size (via postMessage /
-        // scrollHeight fallback), so vertical scrolling inside the webview is not
-        // needed — the parent chat ScrollView handles page-level scroll.
-        webView.scrollView.isScrollEnabled = false
-        webView.scrollView.bounces = false
-        webView.scrollView.showsVerticalScrollIndicator = false
+        // cancelsTouchesInView = false is kept so any pan recognizer still in the
+        // tree doesn't swallow horizontal drags (e.g. sliders inside embeds).
+        webView.scrollView.isScrollEnabled = true
+        webView.scrollView.bounces = true
+        webView.scrollView.showsVerticalScrollIndicator = true
         webView.scrollView.showsHorizontalScrollIndicator = false
         webView.scrollView.delaysContentTouches = false
-        // Belt-and-suspenders: also set cancelsTouchesInView = false so any
-        // residual recognizer still in the tree doesn't swallow horizontal drags.
         webView.scrollView.panGestureRecognizer.cancelsTouchesInView = false
 
         webView.navigationDelegate = context.coordinator
@@ -2022,28 +2199,14 @@ private struct RichUIWebView: UIViewRepresentable {
 
 // MARK: - Tool Call Result Block View
 
-/// Renders the OUTPUT section as a syntax-highlighted code block via MarkdownView.
-/// JSON results are pretty-printed and displayed with JSON syntax highlighting.
-/// All other text is shown as plain monospaced output. The underlying CodeView
-/// uses virtual line windowing — only the visible lines are laid out, matching
-/// the same "only parse what's shown" behaviour as regular markdown code blocks.
+/// Renders the OUTPUT section as a plain monospaced text block.
+/// JSON results are pretty-printed. Uses a simple ScrollView+Text instead of
+/// MarkdownView to avoid async WKWebView zero-height collapse on first render.
 private struct ToolCallResultBlockView: View {
     let content: String
 
     @Environment(\.theme) private var theme
-    @Environment(\.accessibilityScale) private var accessibilityScale
-
-    private static let baseBodyFontSize: CGFloat = UIFont.preferredFont(forTextStyle: .body).pointSize
-
-    /// Builds a MarkdownTheme scaled to the current accessibility text size.
-    private var scaledTheme: MarkdownTheme {
-        let scale = accessibilityScale.scale(for: .content)
-        var t = MarkdownTheme.default
-        if abs(scale - 1.0) > 0.01 {
-            t.align(to: Self.baseBodyFontSize * scale)
-        }
-        return t
-    }
+    @State private var showFullPreview = false
 
     /// Pretty-prints the content if it is JSON, otherwise returns the raw string.
     /// Also handles double-encoded JSON strings (e.g. `"\"{ ... }\""` ).
@@ -2073,39 +2236,71 @@ private struct ToolCallResultBlockView: View {
         return content
     }
 
-    /// Language hint passed to the code fence. `json` enables syntax highlighting;
-    /// plain text output falls back to an empty language tag (monospaced, no colours).
-    private var codeLanguage: String {
-        guard let data = content.data(using: .utf8),
-              let _ = try? JSONSerialization.jsonObject(with: data) else {
-            // Also accept double-encoded JSON
-            let stripped = content.trimmingCharacters(in: .whitespacesAndNewlines)
-            if stripped.hasPrefix("\"") && stripped.hasSuffix("\"") {
-                let inner = String(stripped.dropFirst().dropLast())
-                    .replacingOccurrences(of: "\\\"", with: "\"")
-                    .replacingOccurrences(of: "\\n", with: "\n")
-                    .replacingOccurrences(of: "\\\\", with: "\\")
-                if let d = inner.data(using: .utf8),
-                   let _ = try? JSONSerialization.jsonObject(with: d) {
-                    return "json"
-                }
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            ScrollView([.vertical, .horizontal], showsIndicators: false) {
+                Text(formattedContent)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .multilineTextAlignment(.leading)
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            return ""
+            .frame(maxHeight: 200)
+            .background(theme.surfaceContainer.opacity(theme.isDark ? 0.35 : 0.25))
+            .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous)
+                    .strokeBorder(theme.cardBorder.opacity(0.35), lineWidth: 0.5)
+            )
+
+            // Eye / preview button
+            Button {
+                showFullPreview = true
+            } label: {
+                Image(systemName: "eye")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(theme.textTertiary)
+                    .padding(6)
+                    .background(theme.surfaceContainer.opacity(0.8))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            .padding(6)
         }
-        return "json"
+        .sheet(isPresented: $showFullPreview) {
+            ToolCallResultFullPreviewSheet(content: formattedContent)
+        }
     }
+}
+
+// MARK: - Full-screen preview sheet for tool call output
+
+private struct ToolCallResultFullPreviewSheet: View {
+    let content: String
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.theme) private var theme
 
     var body: some View {
-        MarkdownView(
-            "```\(codeLanguage)\n\(formattedContent)\n```",
-            theme: scaledTheme
-        )
-        .codeBarHidden(true)
-        .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous)
-                .strokeBorder(theme.cardBorder.opacity(0.35), lineWidth: 0.5)
-        )
+        NavigationView {
+            ScrollView {
+                Text(content)
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(theme.textPrimary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+            .background(theme.background)
+            .navigationTitle("Output")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
     }
 }
 
@@ -2217,44 +2412,62 @@ struct ToolCallView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // ── Header (tappable to expand/collapse) ─────────────────────
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    isExpanded.toggle()
-                }
-            } label: {
+            // ── Header (tappable to expand/collapse, unless awaiting user input) ────
+            if toolCall.needsUserInput {
+                // ask_user pending — non-interactive pill: spinner + "Input needed"
+                // The actual question card lives above the chat input (AskUserCard).
                 HStack(spacing: 8) {
-                    // Status indicator
-                    if toolCall.isDone {
-                        Image(systemName: "checkmark.circle.fill")
-                            .scaledFont(size: 14)
-                            .foregroundStyle(theme.success)
-                    } else {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(theme.brandPrimary)
-                    }
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(theme.brandPrimary)
 
-                    // "View Result from tool_name" — matches Open WebUI web UI pattern
-                    (Text("View Result from ")
-                        .foregroundStyle(theme.textTertiary)
-                     + Text(toolCall.name)
-                        .foregroundStyle(theme.textPrimary)
-                        .fontWeight(.semibold))
+                    Text("Input needed")
                         .scaledFont(size: 13, weight: .medium)
+                        .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
-                        .truncationMode(.middle)
 
                     Spacer()
-
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .scaledFont(size: 10, weight: .semibold)
-                        .foregroundStyle(theme.textTertiary)
                 }
                 .padding(.vertical, 10)
-                .contentShape(Rectangle())
+            } else {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        // Status indicator
+                        if toolCall.isDone {
+                            Image(systemName: toolCall.isError ? "xmark.circle.fill" : "checkmark.circle.fill")
+                                .scaledFont(size: 14)
+                                .foregroundStyle(toolCall.isError ? theme.error : theme.success)
+                        } else {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(theme.brandPrimary)
+                        }
+
+                        // "View Result from tool_name" — matches Open WebUI web UI pattern
+                        (Text("View Result from ")
+                            .foregroundStyle(theme.textTertiary)
+                         + Text(toolCall.name)
+                            .foregroundStyle(theme.textPrimary)
+                            .fontWeight(.semibold))
+                            .scaledFont(size: 13, weight: .medium)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+
+                        Spacer()
+
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .scaledFont(size: 10, weight: .semibold)
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
 
             // ── Body ─────────────────────────────────────────────────────
             AnimatedPresence(visible: isExpanded) {
@@ -2338,6 +2551,11 @@ private struct MixedToolCallGroup: View {
         toolItems.allSatisfy(\.isDone)
     }
 
+    /// True when ANY tool item in the group is an ask_user awaiting input.
+    private var hasNeedsInput: Bool {
+        toolItems.contains { $0.needsUserInput }
+    }
+
     /// Comma-separated unique tool names (order of first appearance).
     private var groupLabel: String {
         var seen = Set<String>()
@@ -2365,17 +2583,25 @@ private struct MixedToolCallGroup: View {
                             .tint(theme.brandPrimary)
                     }
 
-                    (Text("Explored ")
-                        .foregroundStyle(theme.textTertiary)
-                     + Text("\(toolItems.count) ")
-                        .foregroundStyle(theme.textPrimary)
-                        .fontWeight(.semibold)
-                     + Text(groupLabel)
-                        .foregroundStyle(theme.textPrimary)
-                        .fontWeight(.semibold))
-                        .scaledFont(size: 13, weight: .medium)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    if hasNeedsInput && !allDone {
+                        // Show "Input needed" as the summary when ask_user is pending
+                        Text("Input needed")
+                            .scaledFont(size: 13, weight: .medium)
+                            .foregroundStyle(theme.textSecondary)
+                            .lineLimit(1)
+                    } else {
+                        (Text("Explored ")
+                            .foregroundStyle(theme.textTertiary)
+                         + Text("\(toolItems.count) ")
+                            .foregroundStyle(theme.textPrimary)
+                            .fontWeight(.semibold)
+                         + Text(groupLabel)
+                            .foregroundStyle(theme.textPrimary)
+                            .fontWeight(.semibold))
+                            .scaledFont(size: 13, weight: .medium)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
 
                     Spacer()
 
@@ -2607,45 +2833,86 @@ struct AssistantMessageContent: View {
     /// APIClient for rendering inline images via AuthenticatedImageView.
     var apiClient: APIClient? = nil
 
-    @State private var parseCache = ParseCache()
-
-    /// Reference-type cache for ToolCallParser results. Mutating a class
-    /// property during body evaluation is safe because SwiftUI only tracks
-    /// `@State`/`@Observable` value changes, not internal class mutations.
-    private final class ParseCache {
-        /// utf8.count of the last cached content (O(1) — Swift caches this internally).
-        /// We use utf8.count rather than hashValue because hashValue is O(N)
-        /// (walks all grapheme clusters), which is the main source of per-frame CPU cost.
-        /// When the count matches, we also do a fast pointer/identity check via
-        /// `lastContent` before falling back to `==` to handle the rare case where
-        /// the byte count is stable but content changed (e.g. streaming attribute edits).
-        var lastByteCount: Int = -1
-        /// Cached content string for identity-level equality guard.
-        var lastContent: String = ""
-        var lastResult: ToolCallParser.OrderedParseResult?
-    }
+    /// Holds the result currently being displayed. On a global-cache hit the result
+    /// is injected synchronously from `body`; on a cache miss it starts as `nil`
+    /// (showing a plain-text placeholder for one frame) and is populated by an
+    /// async `Task` that runs `parseOrdered` off the main thread.
+    @State private var resolvedResult: ToolCallParser.OrderedParseResult? = nil
+    /// Tracks which content string `resolvedResult` was computed for so we don't
+    /// re-trigger async work when `body` re-evaluates with the same content.
+    @State private var resolvedContent: String = ""
+    /// Guards against duplicate `Task(priority: .userInitiated)` spawns when
+    /// SwiftUI re-evaluates `body` multiple times before the async parse settles.
+    /// Without this, rapid body re-evaluations during streaming can queue many
+    /// identical background parses, spiking CPU to 180%+.
+    @State private var parseInFlight: Bool = false
 
     var body: some View {
-        // Cache key: utf8.count is O(1) (Swift caches it on the String's internal
-        // storage). When count matches we do a fast String == check to guard against
-        // the rare case where byte count is identical but content differs (e.g.
-        // done="false" → done="true" with equal byte count). Because the string is
-        // the same object during a cache-hit frame the == fast-paths to pointer equality
-        // in most cases, costing essentially zero.
-        let byteCount = content.utf8.count
+        // ── Global cache lookup (synchronous, O(1) path) ──────────────────────
+        // MessageParseCache is an actor so we cannot call it synchronously from
+        // body. Instead the cache stores its NSCache directly — we access it
+        // via the actor's nonisolated helper to stay off the actor's executor.
         let ordered: ToolCallParser.OrderedParseResult = {
-            if byteCount == parseCache.lastByteCount && content == parseCache.lastContent,
-               let cached = parseCache.lastResult {
+            // Check if the in-view state already has the result for this exact content.
+            if resolvedContent == content, let cached = resolvedResult {
                 return cached
             }
-            let result = ToolCallParser.parseOrdered(content)
-            parseCache.lastByteCount = byteCount
-            parseCache.lastContent = content
-            parseCache.lastResult = result
-            // Log segment count and VIZ presence once per parse
+            // Ask the global cache (actor-internal NSCache, thread-safe read).
+            // We do a best-effort synchronous lookup via a nonisolated wrapper.
+            if let globalHit = MessageParseCache.shared.lookupSync(content) {
+                // Sync the result into @State so subsequent renders are free.
+                // This mutation is from within body — we defer it to the next runloop
+                // tick via a no-animation transaction to avoid "state modified during
+                // body evaluation" warnings while keeping the UI update immediate.
+                if resolvedContent != content {
+                    DispatchQueue.main.async {
+                        resolvedResult = globalHit
+                        resolvedContent = content
+                    }
+                }
+                return globalHit
+            }
+            // Cache miss — kick off background parse if not already in flight.
+            // `parseInFlight` prevents duplicate Task spawns when SwiftUI
+            // re-evaluates body multiple times before the async parse settles
+            // (common during streaming — without this guard, each re-evaluation
+            // queues another `.userInitiated` Task, spiking CPU to 180%+).
+            if resolvedContent != content && !parseInFlight {
+                parseInFlight = true
+                let contentToparse = content
+                Task(priority: .userInitiated) {
+                    let result = await MessageParseCache.shared.parseAndStore(content: contentToparse)
+                    await MainActor.run {
+                        // Only apply if content hasn't changed by the time we return.
+                        guard contentToparse == content else {
+                            parseInFlight = false
+                            return
+                        }
+                        resolvedResult = result
+                        resolvedContent = contentToparse
+                        parseInFlight = false
+                    }
+                }
+            }
+            // Return a minimal placeholder: a single text segment with the raw content.
+            // This renders as plain unformatted text for at most one frame before the
+            // async parse completes and SwiftUI swaps in the fully formatted result.
+            if let stale = resolvedResult {
+                // If we have a stale result from a prior content version (e.g. during
+                // streaming), show it rather than a raw dump — it looks better.
+                return stale
+            }
+            return ToolCallParser.OrderedParseResult(
+                segments: [.text(content)],
+                allToolCalls: []
+            )
+        }()
+
+        // Log VIZ presence once per parse (preserved from original).
+        let _ = {
             let hasViz = content.contains("@@@VIZ-START")
-            if hasViz {
-                let segTypes = result.segments.map { seg -> String in
+            if hasViz, resolvedContent == content {
+                let segTypes = ordered.segments.map { seg -> String in
                     switch seg {
                     case .text(let s): return "text(\(s.count))"
                     case .toolCall(let tc): return "toolCall(\(tc.name))"
@@ -2654,7 +2921,6 @@ struct AssistantMessageContent: View {
                 }.joined(separator: ", ")
                 vizLog.debug("AssistantMessageContent VIZ segments: \(segTypes)")
             }
-            return result
         }()
 
         let groups: [SegmentGroup] = {
@@ -2703,6 +2969,7 @@ struct AssistantMessageContent: View {
                                 arguments: tc.arguments,
                                 result: tc.result,
                                 isDone: tc.isDone,
+                                status: tc.status,
                                 embeds: messageEmbeds
                             ))
                             mutableGroups[i] = .toolCalls(items)
@@ -2723,7 +2990,7 @@ struct AssistantMessageContent: View {
                 // Without this, the infinity-width VStack container can misplace
                 // or stretch the 44×22pt fixed view.
                 HStack(spacing: 0) {
-                    TypingIndicator()
+                    BlinkingCursorIndicator()
                     Spacer()
                 }
             } else {
@@ -2823,7 +3090,7 @@ struct AssistantMessageContent: View {
                         // Without this, the infinity-width VStack container can misplace
                         // or stretch the 44×22pt fixed view.
                         HStack(spacing: 0) {
-                            TypingIndicator()
+                            BlinkingCursorIndicator()
                             Spacer()
                         }
                     }

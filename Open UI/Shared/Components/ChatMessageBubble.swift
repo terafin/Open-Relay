@@ -49,8 +49,16 @@ struct ChatMessageBubble<Content: View>: View {
     // MARK: - User Bubble
 
     private var userBubble: some View {
-        HStack(alignment: .bottom, spacing: 0) {
-            Spacer(minLength: 64)
+        // Cap the bubble at 80% of the physical screen width so it never
+        // overflows on small devices (iPhone SE) or wide columns (iPad).
+        // Using UIScreen.main.bounds.width is intentional — we want the
+        // physical screen width as the cap, not the SwiftUI container width,
+        // and avoiding GeometryReader prevents the zero-height collapse bug
+        // that occurs when GeometryReader is inside a ScrollView.
+        let maxBubbleWidth = UIScreen.main.bounds.width * 0.80
+
+        return HStack(alignment: .bottom, spacing: 0) {
+            Spacer()
 
             VStack(alignment: .trailing, spacing: 4) {
                 content()
@@ -71,6 +79,7 @@ struct ChatMessageBubble<Content: View>: View {
                     }
                 }
             }
+            .frame(maxWidth: maxBubbleWidth, alignment: .trailing)
         }
         .padding(.horizontal, Spacing.screenPadding)
         .padding(.vertical, 2)
@@ -79,7 +88,14 @@ struct ChatMessageBubble<Content: View>: View {
     // MARK: - Assistant Content (no bubble — clean full-width)
 
     private var assistantContent: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        // Cap assistant content so that content frame + horizontal padding = screen width.
+        // Subtracting the padding from the cap here prevents the total rendered width
+        // from exceeding UIScreen width — which was causing a horizontal overflow on
+        // smaller devices (iPhone 12 Pro etc.) that stretched the entire chat layout
+        // including the navbar and input bar beyond the visible viewport.
+        let maxContentWidth = UIScreen.main.bounds.width - (Spacing.screenPadding * 2)
+
+        return VStack(alignment: .leading, spacing: 4) {
             content()
                 .foregroundStyle(theme.chatBubbleAssistantText)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -91,6 +107,7 @@ struct ChatMessageBubble<Content: View>: View {
                 }
             }
         }
+        .frame(maxWidth: maxContentWidth, alignment: .leading)
         .padding(.horizontal, Spacing.screenPadding)
         .padding(.vertical, 2)
     }
@@ -177,45 +194,31 @@ private struct UserBubbleShape: Shape {
     }
 }
 
-// MARK: - Typing Indicator
+// MARK: - Blinking Cursor Indicator
 
-/// An animated typing indicator shown while the assistant is composing.
-struct TypingIndicator: View {
-    @State private var animate = false
+/// A minimal blinking cursor shown while the assistant is waiting to respond.
+/// Replaces the old bouncing-dots TypingIndicator with a clean, non-bouncing
+/// vertical bar that fades in and out — like a text cursor about to type.
+struct BlinkingCursorIndicator: View {
+    @State private var opacity: Double = 0.2
     @Environment(\.theme) private var theme
 
     var body: some View {
-        HStack(spacing: 5) {
-            ForEach(0..<3, id: \.self) { i in
-                Circle()
-                    .fill(theme.textTertiary)
-                    // Fixed frame — never changes size, so layout is perfectly stable.
-                    .frame(width: 7, height: 7)
-                    // Offset-based bounce: moves the dot up/down without touching the
-                    // layout frame at all. No scaleEffect = no layout re-measurement
-                    // on every animation tick, eliminating the "jumping around" artifact.
-                    .offset(y: animate ? -3 : 0)
-                    .opacity(animate ? 1.0 : 0.4)
-                    .animation(
-                        .easeInOut(duration: 0.5)
-                            .repeatForever(autoreverses: true)
-                            .delay(Double(i) * 0.18),
-                        value: animate
-                    )
+        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+            .fill(theme.textSecondary)
+            .frame(width: 2, height: 16)
+            .opacity(opacity)
+            .onAppear {
+                withAnimation(
+                    .easeInOut(duration: 0.9)
+                        .repeatForever(autoreverses: true)
+                ) {
+                    opacity = 0.9
+                }
             }
-        }
-        // Fixed intrinsic size so the indicator occupies the same space as a
-        // single line of text — prevents layout recalculation on appear/disappear.
-        // fixedSize(vertical:) ensures the HStack never stretches taller than 22pt
-        // even when placed inside a maxWidth:.infinity container.
-        .frame(width: 44, height: 22, alignment: .leading)
-        .fixedSize()
-        .onAppear { animate = true }
-        // Bug 8: explicitly stop the three repeatForever CAAnimations when TypingIndicator
-        // leaves the hierarchy (first token arrives). Without this, the CAAnimation objects
-        // remain alive on their hosting layers until UIKit's view recycling discards them,
-        // accumulating over multiple regenerations.
-        .onDisappear { animate = false }
+            .onDisappear {
+                withAnimation(nil) { opacity = 0.2 }
+            }
     }
 }
 
@@ -283,10 +286,10 @@ struct MessageActionBar: View {
                 Text("That's really helpful!")
             }
 
-            // Typing indicator
+            // Blinking cursor indicator
             HStack {
                 VStack(alignment: .leading) {
-                    TypingIndicator()
+                    BlinkingCursorIndicator()
                 }
                 .padding(.horizontal, Spacing.screenPadding)
                 Spacer()

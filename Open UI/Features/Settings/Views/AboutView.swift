@@ -150,10 +150,15 @@ struct AboutView: View {
                     if checker.isChecking {
                         ProgressView()
                             .scaleEffect(0.8)
-                    } else if showServerUpToDate && checker.availableUpdate == nil {
+                    } else if showServerUpToDate && checker.pendingUpdate == nil {
                         Label("Up to date", systemImage: "checkmark.circle.fill")
                             .scaledFont(size: 12)
                             .foregroundStyle(.green)
+                            .labelStyle(.titleAndIcon)
+                    } else if showServerUpToDate && checker.pendingUpdate != nil {
+                        Label("Update available", systemImage: "arrow.up.circle.fill")
+                            .scaledFont(size: 12)
+                            .foregroundStyle(.orange)
                             .labelStyle(.titleAndIcon)
                     } else {
                         Image(systemName: "arrow.clockwise")
@@ -191,10 +196,15 @@ struct AboutView: View {
                     if checker.isChecking {
                         ProgressView()
                             .scaleEffect(0.8)
-                    } else if showUpToDate && checker.availableUpdate == nil {
+                    } else if showUpToDate && checker.pendingUpdate == nil {
                         Label("Up to date", systemImage: "checkmark.circle.fill")
                             .scaledFont(size: 12)
                             .foregroundStyle(.green)
+                            .labelStyle(.titleAndIcon)
+                    } else if showUpToDate && checker.pendingUpdate != nil {
+                        Label("Update available", systemImage: "arrow.up.circle.fill")
+                            .scaledFont(size: 12)
+                            .foregroundStyle(.orange)
                             .labelStyle(.titleAndIcon)
                     } else {
                         Image(systemName: "arrow.clockwise")

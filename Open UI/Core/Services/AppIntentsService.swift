@@ -1,5 +1,6 @@
 import AppIntents
 import Foundation
+import UIKit
 
 // MARK: - New Chat Intent
 
@@ -95,6 +96,70 @@ struct FileChatIntent: AppIntent {
     }
 }
 
+// MARK: - Ask Intent
+
+/// Siri shortcut / Shortcuts app: open a new chat with a pre-filled prompt,
+/// optional model selection, and optional auto-send.
+///
+/// Enables power-user workflows like:
+/// - Raycast: `open "openui://new-chat?prompt=\(query)&send=true"`
+/// - Apple Shortcuts: "Ask Open Relay to [prompt]"
+/// - Siri: "Ask Open Relay to summarise my notes"
+struct AskIntent: AppIntent {
+    static var title: LocalizedStringResource = "Ask Open Relay"
+    static var description = IntentDescription(
+        "Open a new chat with a pre-filled prompt. Optionally specify a model and whether to send immediately."
+    )
+    static var openAppWhenRun: Bool = true
+
+    /// The prompt text to pre-fill in the chat input.
+    @Parameter(title: "Prompt", description: "The message to send to the AI assistant.")
+    var prompt: String
+
+    /// Optional model ID to select (e.g. "gpt-4o", "claude-3-5-sonnet"). Leave blank to use the default.
+    @Parameter(title: "Model ID", description: "The model to use (optional). Leave blank to use your default model.", default: "")
+    var modelId: String
+
+    /// When true, the message is sent automatically without requiring the user to tap Send.
+    @Parameter(title: "Auto-send", description: "If enabled, the prompt is sent immediately when the app opens.", default: false)
+    var autoSend: Bool
+
+    func perform() async throws -> some IntentResult {
+        // Build a URL that routes through the existing handleDeepLink() infrastructure.
+        // This ensures all timing, validation, and notification-posting logic is shared
+        // with the URL scheme path — no duplicate logic here.
+        var components = URLComponents()
+        components.scheme = "openui"
+        components.host = "new-chat"
+        var items: [URLQueryItem] = []
+        let trimmedPrompt = String(prompt.prefix(4000))
+        if !trimmedPrompt.isEmpty {
+            items.append(URLQueryItem(name: "prompt", value: trimmedPrompt))
+        }
+        let trimmedModel = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedModel.isEmpty {
+            items.append(URLQueryItem(name: "model", value: trimmedModel))
+        }
+        if autoSend && !trimmedPrompt.isEmpty {
+            items.append(URLQueryItem(name: "send", value: "true"))
+        }
+        components.queryItems = items.isEmpty ? nil : items
+
+        // If we can build a valid URL, open it so the app processes it through
+        // the standard handleDeepLink() path. Fallback: post the notification directly.
+        if let url = components.url {
+            await MainActor.run {
+                UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            }
+        } else {
+            await MainActor.run {
+                NotificationCenter.default.post(name: .openUINewChatWithFocus, object: nil)
+            }
+        }
+        return .result()
+    }
+}
+
 // MARK: - New Channel Intent
 
 /// Siri shortcut / Shortcuts app: open the create-channel sheet.
@@ -114,80 +179,6 @@ struct NewChannelIntent: AppIntent {
     }
 }
 
-// MARK: - App Shortcuts Provider
-
-/// Provides the app's shortcuts to the Shortcuts app and Siri.
-/// All shortcuts mirror the widget quick-action buttons exactly.
-struct OpenUIShortcutsProvider: AppShortcutsProvider {
-    static var appShortcuts: [AppShortcut] {
-        AppShortcut(
-            intent: NewChatIntent(),
-            phrases: [
-                "Start a new chat in \(.applicationName)",
-                "New conversation in \(.applicationName)",
-                "Chat with \(.applicationName)",
-                "Ask \(.applicationName) something"
-            ],
-            shortTitle: "New Chat",
-            systemImageName: "bubble.left.and.text.bubble.right"
-        )
-
-        AppShortcut(
-            intent: VoiceCallIntent(),
-            phrases: [
-                "Call \(.applicationName)",
-                "Voice call with \(.applicationName)",
-                "Talk to \(.applicationName)"
-            ],
-            shortTitle: "Voice Call",
-            systemImageName: "mic.fill"
-        )
-
-        AppShortcut(
-            intent: CameraChatIntent(),
-            phrases: [
-                "Camera chat with \(.applicationName)",
-                "Take a photo for \(.applicationName)",
-                "Open camera in \(.applicationName)"
-            ],
-            shortTitle: "Camera Chat",
-            systemImageName: "camera.fill"
-        )
-
-        AppShortcut(
-            intent: PhotosChatIntent(),
-            phrases: [
-                "Send a photo to \(.applicationName)",
-                "Photos chat in \(.applicationName)",
-                "Attach a photo in \(.applicationName)"
-            ],
-            shortTitle: "Photos Chat",
-            systemImageName: "photo.fill"
-        )
-
-        AppShortcut(
-            intent: FileChatIntent(),
-            phrases: [
-                "Send a file to \(.applicationName)",
-                "File chat in \(.applicationName)",
-                "Attach a document in \(.applicationName)"
-            ],
-            shortTitle: "File Chat",
-            systemImageName: "paperclip"
-        )
-
-        AppShortcut(
-            intent: NewChannelIntent(),
-            phrases: [
-                "New channel in \(.applicationName)",
-                "Create a channel in \(.applicationName)"
-            ],
-            shortTitle: "New Channel",
-            systemImageName: "number"
-        )
-    }
-}
-
 // MARK: - Notification Names
 
 extension Notification.Name {
@@ -195,6 +186,8 @@ extension Notification.Name {
     static let openUICameraChat  = Notification.Name("com.openui.widget.cameraChat")
     static let openUIPhotosChat  = Notification.Name("com.openui.widget.photosChat")
     static let openUIFileChat    = Notification.Name("com.openui.widget.fileChat")
+    // Photo picker confirmed at window level — userInfo["assets"] = [PHAsset]
+    static let openUIPhotoPickerConfirm = Notification.Name("com.openui.photoPicker.confirm")
     // Widget deep link — open create-channel sheet
     static let openUINewChannel  = Notification.Name("com.openui.widget.newChannel")
     // Widget deep link — start a new chat AND auto-focus the input field (show keyboard)
@@ -203,6 +196,9 @@ extension Notification.Name {
     static let openUIWidgetVoiceCall     = Notification.Name("com.openui.widget.voiceCall")
     // Internal relay: MainChatView → ChatInputField to request keyboard focus
     static let chatInputFieldRequestFocus = Notification.Name("com.openui.input.requestFocus")
+    /// Fired from the folder workspace chat list when the user taps a recent chat row.
+    /// Object: the conversation ID (String).
+    static let folderWorkspaceChatSelected = Notification.Name("com.openui.folder.chatSelected")
     // Broadcast: dismiss all presented overlays (camera, file picker, voice call, sheets)
     // before starting a new quick action to prevent stacking.
     static let openUIDismissOverlays = Notification.Name("com.openui.dismissOverlays")

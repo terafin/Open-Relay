@@ -7,6 +7,7 @@ struct ServerManagementView: View {
     @State private var editingURL: String = ""
     @State private var editingName: String = ""
     @State private var editingSelfSigned: Bool = false
+    @State private var editingSwitchStatusURL: String = ""
     @State private var editingHeaderEntries: [CustomHeaderEntry] = []
     @State private var isEditing: Bool = false
     @State private var showDeleteConfirmation = false
@@ -218,21 +219,62 @@ struct ServerManagementView: View {
     private func checkHealth() async {
         guard let config = activeServer else { return }
         isCheckingHealth = true
+        // Reset so the dot shows "checking" (gray) rather than a stale prior result
+        serverHealthy = nil
+
         let client = APIClient(serverConfig: config)
         // Re-use the existing auth token so the request is authenticated
         if let token = dependencies.apiClient?.network.authToken {
             client.updateAuthToken(token)
         }
-        async let healthTask = client.checkHealth()
-        async let configTask: BackendConfig? = try? await client.getBackendConfig()
-        let (healthy, freshConfig) = await (healthTask, configTask)
-        serverHealthy = healthy
-        if let fresh = freshConfig {
-            refreshedConfig = fresh
-            // Keep the view model in sync too
-            viewModel.backendConfig = fresh
+
+        // The health dot and the config fetch run concurrently but are fully
+        // decoupled:
+        //
+        // • Task 1 (/health, 8 s timeout) — resolves `serverHealthy` and clears
+        //   `isCheckingHealth` as soon as the endpoint responds.  It does NOT
+        //   wait for /api/config.  This is the critical change: previously both
+        //   requests were awaited together, so a slow /api/config (30 s default
+        //   timeout) would block the health dot until the outer 12 s hard deadline
+        //   fired and set serverHealthy = false — showing a false "Connection Issue"
+        //   even though /health was reachable.
+        //
+        // • Task 2 (/api/config, 10 s timeout) — updates version info if it arrives.
+        //   Runs as a best-effort background task; does not affect the health dot.
+        //
+        // • Task 3 (hard deadline) — safety net: if /health somehow never responds
+        //   (TCP black-hole, etc.) this fires at 12 s and marks the check as failed.
+        await withTaskGroup(of: Void.self) { group in
+            // Task 1: health check — resolves the dot independently
+            group.addTask {
+                let healthy = await client.checkHealthFast(timeout: 8)
+                await MainActor.run {
+                    self.serverHealthy = healthy
+                    self.isCheckingHealth = false
+                }
+            }
+            // Task 2: config fetch — best-effort, does not block the health dot
+            group.addTask {
+                let freshConfig = try? await client.getBackendConfig()
+                await MainActor.run {
+                    if let fresh = freshConfig {
+                        self.refreshedConfig = fresh
+                        self.viewModel.backendConfig = fresh
+                    }
+                }
+            }
+            // Task 3: hard deadline — ensures the spinner always clears
+            group.addTask {
+                try? await Task.sleep(for: .seconds(12))
+                await MainActor.run {
+                    guard self.isCheckingHealth else { return }
+                    self.serverHealthy = self.serverHealthy ?? false
+                    self.isCheckingHealth = false
+                }
+            }
+            // Wait for all tasks (config fetch may still complete after the dot resolves)
+            for await _ in group { }
         }
-        isCheckingHealth = false
     }
 
     // MARK: - Accounts Section
@@ -465,6 +507,7 @@ struct ServerManagementView: View {
             .filter { !systemKeys.contains($0.key) }
             .map { CustomHeaderEntry(id: UUID().uuidString, key: $0.key, value: $0.value) }
             .sorted { $0.key < $1.key }
+        editingSwitchStatusURL = activeServer?.switchStatusURL ?? ""
         isEditing = true
     }
 
@@ -494,6 +537,19 @@ struct ServerManagementView: View {
                     Text("Custom Headers")
                 } footer: {
                     Text("HTTP headers sent with every request to this server. Useful for reverse proxies or services that require extra authentication headers.")
+                        .font(.caption)
+                }
+
+                Section {
+                    TextField("https://localhost:8080/status", text: $editingSwitchStatusURL)
+                        .textContentType(.URL)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                } header: {
+                    Text("Model Switch Status URL")
+                } footer: {
+                    Text("Optional. If set, Open UI will poll this URL while a request is pending and show a banner like \"Loading qwen3-35b ~42s left\". Leave blank to disable. Useful for SGLang or similar proxies that hot-swap models.")
                         .font(.caption)
                 }
             }
@@ -530,6 +586,9 @@ struct ServerManagementView: View {
             updatedHeaders[trimmedKey] = entry.value
         }
         config.customHeaders = updatedHeaders
+
+        let trimmedSwitchURL = editingSwitchStatusURL.trimmingCharacters(in: .whitespaces)
+        config.switchStatusURL = trimmedSwitchURL.isEmpty ? nil : trimmedSwitchURL
 
         dependencies.serverConfigStore.updateServer(config)
         dependencies.refreshServices()

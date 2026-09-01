@@ -7,6 +7,20 @@ import MarkdownView
 import Litext
 import os.log
 
+// MARK: - Scroll Geometry Snapshot
+//
+// A single atomic snapshot of the scroll view's geometry, captured inside
+// onScrollGeometryChange so that contentOffset, contentSize, and containerSize
+// are ALWAYS from the same render pass.  Using three separate @State variables
+// (the old approach) meant they could be stale by 1-2 frames relative to each
+// other, which caused isBouncing to mis-fire during bottom-edge rubber-banding
+// and triggered the nav-bar / FAB jitter the user reported.
+private struct ScrollSnapshot: Equatable {
+    var offset: CGPoint
+    var contentSize: CGSize
+    var containerSize: CGSize
+}
+
 // MARK: - Pump Rate-Limiter
 
 /// A reference-type box that holds the last programmatic scroll timestamp
@@ -15,12 +29,18 @@ import os.log
 /// using a class avoids SwiftUI @State observation overhead on every write.
 private final class PumpRef {
     var lastScrollTime: Date = .distantPast
-    /// Last offset used to compute scroll direction for nav-bar hide/show.
+    /// Last offset used to compute scroll direction for nav-bar direction detection.
     var lastNavBarOffsetY: CGFloat = 0
     /// When set, suppresses all nav-bar hide/show reactions until this date.
     /// Armed before every programmatic scrollTo() call so reflow-induced offset
     /// changes (FAB scroll, stream start, pagination) never trigger the nav bar.
     var programmaticScrollUntil: Date = .distantPast
+    /// Current scroll offset Y — tracked at 120Hz but stored here (not @State) so that
+    /// writing it never triggers a SwiftUI body re-evaluation. Read at tap-time by FAB.
+    var currentScrollOffsetY: CGFloat = 0
+    /// The ID of the message currently nearest the top of the visible viewport.
+    /// Updated continuously; read at FAB tap-time for layout-stable jump targeting.
+    var topmostVisibleMessageId: String? = nil
 }
 
 // MARK: - Chat Detail View
@@ -48,6 +68,11 @@ struct ChatDetailView: View {
     @State private var scrollPosition: ScrollPosition = .init()
     /// True when the user has manually scrolled away from the bottom.
     @State private var isScrolledUp = false
+    /// Curtain flag: keeps the message area invisible until messages are loaded
+    /// AND the scroll position has been set to the bottom. Prevents the user
+    /// from seeing skeleton → messages → scroll animation. Resets to false on
+    /// every new ChatDetailView instance (each conversation has a unique .id).
+    @State private var isContentReady = false
     /// True when the scroll position is at or very near the top (offset.y < 50pt).
     /// Used to hide the ↑ FAB when already at the very top.
     @State private var isAtTop = false
@@ -58,20 +83,31 @@ struct ChatDetailView: View {
     /// Cached scroll content height — updated via onScrollGeometryChange.
     @State private var viewState_contentHeight: CGFloat = 0
     /// Cached scroll container height — updated via onScrollGeometryChange.
-    @State private var viewState_containerHeight: CGFloat = 0
-    /// Current scroll offset Y — tracked continuously to determine which user message
-    /// is near the viewport top when the ↑ FAB is first tapped.
-    @State private var currentScrollOffsetY: CGFloat = 0
-    /// The ID of the message currently nearest the top of the visible viewport.
-    /// Captured when streaming ends so we can restore scroll position by identity
-    /// (layout-stable) rather than raw Y offset (invalidated by content-height changes
-    /// like AnimatedPresence follow-up pill animation).
-    @State private var topmostVisibleMessageId: String? = nil
+    /// Pre-seeded with screen height so welcomeView Spacers can centre content
+    /// from the very first frame (avoids the top→centre jump when a new
+    /// ChatDetailView is instantiated and the async measurement hasn't fired yet).
+    @State private var viewState_containerHeight: CGFloat = UIScreen.main.bounds.height
+    // currentScrollOffsetY and topmostVisibleMessageId are stored in _pumpRef (PumpRef class)
+    // to avoid @State observation overhead — writing them on every 120Hz scroll frame was
+    // causing the entire view body to re-evaluate, causing low-FPS scrolling. They are read
+    // at button tap-time from _pumpRef where needed.
     /// True while a user gesture (finger touch or inertia deceleration) is driving
-    /// the scroll view. This is the ONLY condition under which auto-scroll can be
-    /// disengaged — layout reflows, WKWebView resizes, and programmatic scrolls
-    /// never set this flag because they emit .animating/.idle phases, not .interacting.
+    /// the scroll view. Used by the streaming pump to yield to the user's finger/inertia.
+    /// Layout reflows, WKWebView resizes, and programmatic scrolls never set this flag
+    /// because they emit .animating/.idle phases, not .interacting or .decelerating.
     @State private var isUserDriving = false
+    /// True ONLY while the user's finger is physically on the screen (.interacting phase).
+    /// Used exclusively for nav-bar hide/show and isScrolledUp trip so that inertia
+    /// deceleration + bounce recovery (which is .decelerating, NOT .interacting) can
+    /// never trigger jittery nav-bar show/hide at the bottom edge.
+    @State private var isFingerDriving = false
+    /// True while iOS is decelerating (coasting) after the user lifts their finger.
+    /// The streaming pump must NOT fire during deceleration — each programmatic
+    /// scrollTo() call cancels the OS momentum curve, causing the instant-stop
+    /// behaviour the user reported (swipe → lifts finger → scroll stops dead instead
+    /// of coasting to a smooth stop). Stored in @State rather than PumpRef so that
+    /// the pump guard inside onScrollGeometryChange reads the live value.
+    @State private var isDecelerating = false
     /// Rate-limit timestamp for the streaming scroll pump (writes are non-rendering).
     private let _pumpRef = PumpRef()
     /// Whether the navigation bar is currently hidden.
@@ -91,7 +127,7 @@ struct ChatDetailView: View {
     /// Guard to prevent rapid-fire pagination triggers.
     @State private var isLoadingMoreMessages = false
     /// Maximum messages rendered at once (the sliding-window cap).
-    private let maxWindowSize = 10
+    private let maxWindowSize = 12
 
 
     // MARK: UI state
@@ -115,6 +151,8 @@ struct ChatDetailView: View {
     @State private var ttsGeneratingMessageId: String?
     @State private var usagePopoverMessageId: String?
     @State private var sourcesSheetMessage: ChatMessage?
+    @State private var feedbackDetailMessage: ChatMessage? = nil
+    @State private var subagentDetailMessage: ChatMessage? = nil
     @State private var randomPrompts: [SuggestedPrompt] = []
 
     // MARK: Model mention (@ trigger)
@@ -122,10 +160,16 @@ struct ChatDetailView: View {
     @State private var modelPickerQuery = ""
     @State private var mentionedModel: AIModel? = nil
 
-    // MARK: Inline edit
+    // MARK: Inline edit (user messages)
     @State private var editingMessageId: String?
     @State private var editingMessageText = ""
+    @State private var editingMessageFiles: [ChatMessageFile] = []
     @FocusState private var isEditFieldFocused: Bool
+
+    // MARK: Inline edit (assistant messages — in-place content save, no regeneration)
+    @State private var editingAssistantMessageId: String?
+    @State private var editingAssistantText = ""
+    @FocusState private var isAssistantEditFocused: Bool
 
     // MARK: User message version navigation
     /// Tracks the active version index for user messages (edit history).
@@ -153,6 +197,7 @@ struct ChatDetailView: View {
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var showFilePicker = false
     @State private var showPhotosPicker = false
+    @State private var showAnimatedPhotoPicker = false
     @State private var showAudioPicker = false
     @State private var showCameraPicker = false
     @State private var showWebURLAlert = false
@@ -178,6 +223,12 @@ struct ChatDetailView: View {
     /// Code preview from MarkdownView's eye button (fullscreen code view)
     @State private var codePreviewCode: String?
     @State private var codePreviewLanguage: String = ""
+    // MARK: Voice call model download intercept
+    /// True while the "download TTS model before voice call" sheet is visible.
+    @State private var showVoiceModelDownload = false
+    /// Holds the pre-configured VoiceCallViewModel while the download sheet is open,
+    /// so it can be passed to the router once the model is ready.
+    @State private var pendingVoiceCallVM: VoiceCallViewModel? = nil
 
     // MARK: Init
 
@@ -204,11 +255,42 @@ struct ChatDetailView: View {
         self._viewModel = State(initialValue: viewModel)
     }
 
+    /// Creates a ChatDetailView for an existing conversation that belongs to a folder workspace.
+    /// The `folderWorkspace` is used to show the background image and folder context even
+    /// when viewing existing messages — the background should persist when opening chats inside
+    /// a folder (matches the web UI behaviour where the folder theme stays visible in all chats).
+    init(conversationId: String, viewModel: ChatViewModel, folderWorkspace: ChatFolder?) {
+        self.initialConversationId = conversationId
+        self._folderWorkspace = folderWorkspace
+        self._viewModel = State(initialValue: viewModel)
+    }
+
     private var _folderWorkspace: ChatFolder?
+
+    /// Pre-decoded background image, cached at init time so re-renders never flash black.
+    /// Decoding a large base64 string on every body evaluation would be expensive and cause
+    /// a brief transparent/black frame while the image loads.
+    @State private var _cachedFolderBgImage: UIImage?
+
+    /// Locked-in background image URL. Once we know the URL (either from the initial
+    /// `_folderWorkspace` or a later update) we never allow it to regress to nil, even
+    /// if the parent refreshes the folder list with a flat response that has no meta data.
+    @State private var _lockedFolderBgUrl: String?
 
     /// Called after the chat is successfully deleted, so the parent can
     /// navigate away smoothly (e.g. animate to new chat). Defaults to nil
     /// which falls back to router.popToRoot().
+    /// When true, this chat is from a shared folder where the user only has read permission.
+    /// Hides the input field and shows a "Read only" banner instead.
+    private var isReadOnly: Bool = false
+
+    /// Chainable modifier — enables read-only mode (for shared folders with view-only access).
+    func readOnly(_ enabled: Bool = true) -> ChatDetailView {
+        var copy = self
+        copy.isReadOnly = enabled
+        return copy
+    }
+
     private var deleteChatAction: (() -> Void)?
 
     /// Chainable modifier — lets call sites set the post-delete callback:
@@ -239,6 +321,39 @@ struct ChatDetailView: View {
         return copy
     }
 
+    /// Optional callback invoked when the "Browse Files" button is tapped in the terminal toolbar.
+    /// When set, opens the file browser drawer from the parent (MainChatView) using the
+    /// same scale/blur/push effect as the chat history drawer.
+    private var openFileBrowserAction: (() -> Void)?
+
+    func onOpenFileBrowser(_ action: @escaping () -> Void) -> ChatDetailView {
+        var copy = self
+        copy.openFileBrowserAction = action
+        return copy
+    }
+
+    /// Called when the photo attachment button is tapped — lets the parent render
+    /// AnimatedPhotoPicker at the window level, above all safeAreaInset constraints.
+    /// When nil the photo button sets showAnimatedPhotoPicker directly (legacy path).
+    private var photoPickerRequestAction: (() -> Void)?
+
+    func onPhotoPickerRequest(_ action: @escaping () -> Void) -> ChatDetailView {
+        var copy = self
+        copy.photoPickerRequestAction = action
+        return copy
+    }
+
+    /// Called by the parent after the user confirms a photo selection in the
+    /// parent-level AnimatedPhotoPicker. Passes PHAssets back to ChatDetailView
+    /// so it can upload them via processSelectedPHAssets.
+    private var photoPickerConfirmAction: (([PHAsset]) -> Void)?
+
+    func onPhotoPickerConfirm(_ action: @escaping ([PHAsset]) -> Void) -> ChatDetailView {
+        var copy = self
+        copy.photoPickerConfirmAction = action
+        return copy
+    }
+
     // MARK: - Body
 
     var body: some View {
@@ -246,19 +361,64 @@ struct ChatDetailView: View {
 
         ZStack {
             theme.background.ignoresSafeArea()
+
+            // ── Folder background image ──────────────────────────────────────
+            // Use _lockedFolderBgUrl as the authoritative source (locked in via
+            // .onAppear/.onChange with a folderId guard).
+            // The _folderWorkspace fallback is only used for brand-new chats
+            // (initialConversationId == nil) — there's no stale-state risk there
+            // because a new view instance starts fresh with no prior conversation.
+            // For existing chats (initialConversationId != nil) we NEVER fall back
+            // to _folderWorkspace directly, preventing the background from showing
+            // on regular chats when _lockedFolderBgUrl was never set (i.e. the
+            // folderId guard in .onAppear correctly rejected it).
+            let _bgUrl: String? = _lockedFolderBgUrl
+                ?? (initialConversationId == nil ? _folderWorkspace?.backgroundImageUrl : nil)
+            if let bgUrl = _bgUrl, !bgUrl.isEmpty {
+                GeometryReader { geo in
+                    folderBackgroundImage(url: bgUrl, containerSize: geo.size)
+                }
+                .ignoresSafeArea()
+            }
+
             messageListArea
+
+            // Animated photo picker — legacy inline fallback used only when
+            // the parent view has NOT set photoPickerRequestAction (e.g. in
+            // contexts where ChatDetailView is presented without a MainChatView
+            // parent). When photoPickerRequestAction IS set the parent renders
+            // the picker at the window level, above all safeAreaInset frames.
+            if photoPickerRequestAction == nil {
+                AnimatedPhotoPicker(
+                    isPresented: showAnimatedPhotoPicker,
+                    onConfirm: { assets in
+                        Task { await processSelectedPHAssets(assets) }
+                    },
+                    onDismiss: {
+                        showAnimatedPhotoPicker = false
+                    }
+                )
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         // Custom top bar replaces the system navigation bar entirely.
-        // Using safeAreaInset reserves the correct amount of layout space so
-        // the scroll content is never hidden underneath the bar.  When
-        // navBarHidden is true the bar slides up via offset() and the reserved
-        // height collapses to 0 — both in a single coordinated animation so
-        // the two layers (background + icons) always move as one unit.
+        //
+        // CRITICAL: The safeAreaInset height must NEVER change — it is the source
+        // of viewState_containerHeight (via the scroll geometry callback). If the
+        // inset collapses when navBarHidden flips true, containerHeight changes,
+        // which changes the minHeight VStack, which causes the content to jump
+        // (the jitter seen at the bottom edge).
+        //
+        // Solution: always reserve the full bar height in the safeAreaInset.
+        // Hide the bar purely visually using offset + opacity — the layout
+        // footprint stays constant at all times so the scroll view geometry
+        // never changes when the bar hides or shows.
         .safeAreaInset(edge: .top, spacing: 0) {
             customTopBar
-                .frame(height: navBarHidden ? 0 : nil)
+                .opacity(navBarHidden ? 0 : 1)
                 .offset(y: navBarHidden ? -56 : 0)
-                .clipped()
+                // DO NOT use .frame(height:) here — that would collapse the
+                // reserved safeAreaInset space and change containerHeight.
                 .animation(.easeInOut(duration: 0.22), value: navBarHidden)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -292,24 +452,85 @@ struct ChatDetailView: View {
             // Always rebuild when the server config changes — this handles both the
             // first-launch timing case (randomPrompts is empty) AND the case where
             // the admin updates suggestions on the server while the app is running.
-            randomPrompts = Self.resolvePromptSuggestions(
+            let updated = Self.resolvePromptSuggestions(
                 adminSuggestions: dependencies.authViewModel.backendConfig?.defaultPromptSuggestions,
                 modelSuggestions: viewModel.selectedModel?.suggestionPrompts,
                 count: promptCardCount
             )
+            withTransaction(\.animation, nil) { randomPrompts = updated }
         }
         // Also rebuild prompts when the selected model changes — the new model may
         // have per-model suggestion_prompts that should show as a fallback when the
         // admin hasn't set global prompts.
         .onChange(of: viewModel.selectedModelId) { _, _ in
-            randomPrompts = Self.resolvePromptSuggestions(
+            let updated = Self.resolvePromptSuggestions(
                 adminSuggestions: dependencies.authViewModel.backendConfig?.defaultPromptSuggestions,
                 modelSuggestions: viewModel.selectedModel?.suggestionPrompts,
                 count: promptCardCount
             )
+            withTransaction(\.animation, nil) { randomPrompts = updated }
         }
         .onAppear {
             viewModel.syncOnEntry()
+            // Lock in the background URL on first appear so it survives folder refreshes
+            // that return a flat list without meta data.
+            if _lockedFolderBgUrl == nil, let url = _folderWorkspace?.backgroundImageUrl, !url.isEmpty {
+                // Defence-in-depth: only lock the BGI if this conversation actually
+                // belongs to this folder (guards against folderWorkspace leaking to
+                // non-folder chats via stale state in the parent view).
+                let convFolderId = viewModel.conversation?.folderId
+                if convFolderId != nil && convFolderId == _folderWorkspace?.id {
+                    _lockedFolderBgUrl = url
+                    // Pre-fetch remote images immediately using the authenticated session
+                    // so the background is ready before the GeometryReader fires.
+                    if !url.hasPrefix("data:"), let api = dependencies.apiClient {
+                        let resolvedURL: URL?
+                        if url.hasPrefix("http") {
+                            resolvedURL = URL(string: url)
+                        } else {
+                            // Relative path (e.g. /api/v1/files/<id>/content) —
+                            // resolve against the server base URL.
+                            resolvedURL = URL(string: api.baseURL + url)
+                        }
+                        if let imgURL = resolvedURL {
+                            Task(priority: .userInitiated) {
+                                if let (data, _) = try? await api.network.requestRawAbsoluteURL(imgURL),
+                                   let img = UIImage(data: data) {
+                                    _cachedFolderBgImage = img
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .onChange(of: _folderWorkspace?.backgroundImageUrl) { _, newUrl in
+            // Keep the locked URL updated if the folder's meta is refreshed with a new value,
+            // but only if this conversation actually belongs to this folder.
+            if let url = newUrl, !url.isEmpty {
+                let convFolderId = viewModel.conversation?.folderId
+                if convFolderId != nil && convFolderId == _folderWorkspace?.id {
+                    _lockedFolderBgUrl = url
+                    // Reset cached image and re-fetch when the URL changes to a new remote URL.
+                    if !url.hasPrefix("data:"), let api = dependencies.apiClient {
+                        _cachedFolderBgImage = nil
+                        let resolvedURL: URL?
+                        if url.hasPrefix("http") {
+                            resolvedURL = URL(string: url)
+                        } else {
+                            resolvedURL = URL(string: api.baseURL + url)
+                        }
+                        if let imgURL = resolvedURL {
+                            Task(priority: .userInitiated) {
+                                if let (data, _) = try? await api.network.requestRawAbsoluteURL(imgURL),
+                                   let img = UIImage(data: data) {
+                                    _cachedFolderBgImage = img
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         .onDisappear { handleDisappear() }
         // Stop TTS when app enters background to prevent Metal GPU crashes
@@ -404,6 +625,28 @@ struct ChatDetailView: View {
         .sheet(item: $sourcesSheetMessage) { message in
             SourcesDetailSheet(sources: message.sources)
         }
+        .sheet(item: $feedbackDetailMessage) { msg in
+            FeedbackDetailSheet(message: msg, viewModel: viewModel)
+        }
+        .sheet(item: $subagentDetailMessage) { msg in
+            SubagentResultSheet(message: msg)
+        }
+        // Assistant inline edit sheet — shown when the user taps the pencil icon
+        // on an assistant message. Allows editing content in-place (no regeneration).
+        .sheet(isPresented: Binding(
+            get: { editingAssistantMessageId != nil },
+            set: { if !$0 { cancelAssistantEdit() } }
+        )) {
+            AssistantEditSheet(
+                text: $editingAssistantText,
+                isFocused: $isAssistantEditFocused,
+                onSave: { submitAssistantEdit() },
+                onCancel: { cancelAssistantEdit() }
+            )
+            .themed()
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
         // Prompt variable input sheet — shown when a selected prompt has {{variables}}
         .sheet(isPresented: Binding<Bool>(
             get: { viewModel.pendingPromptForVariables != nil },
@@ -426,7 +669,8 @@ struct ChatDetailView: View {
         // Extracted into a private extension to keep the type-checker expression size manageable.
         .applyLinkAndPromptHandlers(
             viewModel: viewModel,
-            downloadAndShare: { fileId in Task { await downloadAndShareFile(fileId: fileId) } }
+            downloadAndShare: { fileId in Task { await downloadAndShareFile(fileId: fileId) } },
+            downloadAndShareURL: { url in Task { await downloadAndShareArbitraryURL(url) } }
         )
         // Handle "Ask" / "Explain" taps from the text selection menu in assistant
         // messages. Extracted into a private extension to keep the type-checker
@@ -490,9 +734,10 @@ struct ChatDetailView: View {
         }
         // In-app file preview using QuickLook (PDFs, images, docs, etc.)
         .quickLookPreview($previewFileURL)
-        // Chat advanced parameters sheet (slider icon in toolbar)
+        // Chat context / controls panel (slider icon in toolbar)
         .sheet(isPresented: $isShowingChatParams) {
-            ChatAdvancedParamsSheet(
+            ChatContextPanel(
+                viewModel: viewModel,
                 params: Binding(
                     get: { viewModel.conversation?.chatParams ?? viewModel.pendingChatParams ?? ChatAdvancedParams() },
                     set: { newParams in
@@ -520,13 +765,35 @@ struct ChatDetailView: View {
         .applyWidgetAndPickerHandlers(
             showCameraPicker: $showCameraPicker,
             showPhotosPicker: $showPhotosPicker,
+            showAnimatedPhotoPicker: $showAnimatedPhotoPicker,
             showFilePicker: $showFilePicker,
             selectedPhotos: $selectedPhotos,
             codePreviewCode: $codePreviewCode,
             codePreviewLanguage: $codePreviewLanguage,
+            photoPickerRequestAction: photoPickerRequestAction,
+            onProcessPhotos: { assets in await processSelectedPHAssets(assets) },
             onDismissOverlays: { dismissAllPickers() }
         )
         .applyDeleteChatConfirmation(isPresented: $showDeleteChatConfirm, onDelete: performDeleteChat)
+        .sheet(isPresented: $showVoiceModelDownload) {
+            VoiceCallModelDownloadSheet(
+                ttsService: dependencies.textToSpeechService,
+                onReady: {
+                    showVoiceModelDownload = false
+                    if let vm = pendingVoiceCallVM {
+                        pendingVoiceCallVM = nil
+                        router.presentVoiceCall(viewModel: vm)
+                    }
+                },
+                onCancel: {
+                    showVoiceModelDownload = false
+                    pendingVoiceCallVM = nil
+                }
+            )
+            .presentationDetents([.height(420)])
+            .presentationDragIndicator(.hidden)
+            .presentationBackground(Color(white: 0.08))
+        }
     }
 
     // MARK: - Custom top bar (replaces system nav bar to avoid split-layer hide/show bug)
@@ -541,13 +808,9 @@ struct ChatDetailView: View {
                     drawerAction()
                 } label: {
                     Image(systemName: "line.3.horizontal")
-                        .scaledFont(size: 18, weight: .medium)
-                        .foregroundStyle(theme.textSecondary)
-                        .frame(width: 46, height: 46)
-                        .background(theme.surfaceContainer, in: Circle())
+                        .scaledFont(size: 18, weight: .medium, context: .ui)
                 }
                 .buttonStyle(.plain)
-                .contentShape(Circle())
                 .accessibilityLabel("Menu")
             }
 
@@ -555,7 +818,6 @@ struct ChatDetailView: View {
             HStack(spacing: Spacing.xs) {
                 modelSelectorButton
             }
-            .animation(MicroAnimation.gentle, value: viewModel.selectedModelId)
             .frame(maxWidth: .infinity)
 
             // Trailing: all action icons in one grouped pill (matching image 2)
@@ -765,10 +1027,38 @@ struct ChatDetailView: View {
 
     // MARK: - Input Field Area
 
-    @ViewBuilder
-    private func inputFieldArea(vm: ChatViewModel) -> some View {
+    // MARK: - Read-Only Banner
+
+    /// Shown in place of the input field when this chat is from a read-only shared folder.
+    private var readOnlyBanner: some View {
+        HStack(spacing: Spacing.sm) {
+            Image(systemName: "lock.fill")
+                .scaledFont(size: 13, weight: .medium)
+                .foregroundStyle(theme.textTertiary)
+            Text("Read only — shared folder")
+                .scaledFont(size: 14, weight: .medium)
+                .foregroundStyle(theme.textSecondary)
+            Spacer()
+        }
+        .padding(.horizontal, Spacing.md)
+        .padding(.vertical, 14)
+        .background(theme.surfaceContainer.opacity(0.6))
+        .overlay(alignment: .top) { Divider().opacity(0.5) }
+    }
+
+    private func inputFieldArea(vm: ChatViewModel) -> AnyView {
         @Bindable var vm = vm
-        VStack(spacing: 0) {
+
+        // AnyView type-erasure breaks the massive nested generic tuple that SwiftUI
+        // @ViewBuilder builds from this function's many branches. Without it the
+        // compiler inlines every child view into one enormous type, which blows the
+        // thread stack at call time (EXC_BAD_ACCESS in the stack region).
+        if isReadOnly {
+            // ── Read-only mode: show banner instead of input field ──────────
+            return AnyView(readOnlyBanner)
+        }
+        // ── Normal mode: full input field ────────────────────────────────────
+        return AnyView(VStack(spacing: 0) {
             // Picker overlays — rendered above the input field so input stays visible
             if let url = detectedWebURL {
                 webURLSuggestionPill(url: url)
@@ -867,6 +1157,15 @@ struct ChatDetailView: View {
                 ))
             }
 
+            // ── Model-Switch Banner (above input field, issue #79) ──
+            if let switchStatus = vm.modelSwitchStatus, switchStatus.isSwitching {
+                ModelSwitchBannerView(status: switchStatus)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                        removal: .opacity
+                    ))
+            }
+
             // ── Task List Panel (above input field) ──
             if !vm.tasks.isEmpty {
                 TaskListView(
@@ -880,6 +1179,45 @@ struct ChatDetailView: View {
                     insertion: .move(edge: .bottom).combined(with: .opacity),
                     removal: .opacity
                 ))
+            }
+
+            // MARK: - Human-in-the-Loop: Ask User Card
+            // Shown above the input when the model has called ask_user and is waiting.
+            // Priority: live socket prompt (has timeout) > saved history prompt (no timeout).
+            if let askPrompt = vm.liveAskUserPrompt ?? vm.pendingAskUserPrompt {
+                AskUserCard(
+                    questions: askPrompt.questions,
+                    allowOther: askPrompt.allowOther,
+                    timeoutMs: vm.liveAskUserPrompt != nil ? askPrompt.timeoutMs : nil,
+                    onSubmit: { answers in
+                        let msgId = askPrompt.messageId
+                        let cId = askPrompt.callId
+                        Task { await viewModel.answerAskUser(
+                            messageId: msgId, callId: cId,
+                            answers: answers, timedOut: false
+                        )}
+                    },
+                    onCancel: {
+                        let msgId = askPrompt.messageId
+                        let cId = askPrompt.callId
+                        Task { await viewModel.rejectAskUser(messageId: msgId, callId: cId) }
+                    }
+                )
+                .disabled(vm.isResolvingAskUser)
+            }
+
+            // MARK: - Human-in-the-Loop: Tool Approval Banner
+            // Shown above the input when a tool call is paused waiting for user approval.
+            if vm.toolApprovalMode == "ask",
+               let pending = vm.pendingToolApprovalCall,
+               !vm.isTemporaryChat {
+                ToolApprovalBanner(
+                    toolName: pending.toolName,
+                    arguments: pending.arguments,
+                    isResolving: vm.isResolvingToolCall,
+                    onApprove: { Task { await viewModel.approveToolCall() } },
+                    onDeny: { Task { await viewModel.rejectToolCall() } }
+                )
             }
 
             ChatInputField(
@@ -898,6 +1236,7 @@ struct ChatDetailView: View {
                 tools: vm.availableTools,
                 selectedToolIds: $vm.selectedToolIds,
                 isLoadingTools: vm.isLoadingTools,
+                toolsHaveLoaded: vm.toolsHaveLoaded,
                 terminalEnabled: vm.terminalEnabled,
                 isTerminalAvailable: !vm.availableTerminalServers.isEmpty && vm.isTerminalCapableForSelectedModel,
                 terminalServerName: vm.selectedTerminalServer?.displayName ?? "",
@@ -906,7 +1245,7 @@ struct ChatDetailView: View {
                 onTerminalServerSelected: { server in
                     viewModel.selectedTerminalServer = server
                 },
-                onBrowseFiles: nil,
+                onBrowseFiles: openFileBrowserAction,
                 mentionedModel: $mentionedModel,
                 mentionedModelImageURL: mentionedModel.flatMap { viewModel.resolvedImageURL(for: $0) },
                 mentionedModelAuthToken: viewModel.serverAuthToken,
@@ -1004,10 +1343,17 @@ struct ChatDetailView: View {
                     }
                 },
                 onFileAttachment: { showFilePicker = true },
-                onPhotoAttachment: { showPhotosPicker = true },
+                onPhotoAttachment: {
+                    if let request = photoPickerRequestAction {
+                        request()
+                    } else {
+                        showAnimatedPhotoPicker = true
+                    }
+                },
                 onCameraCapture: { showCameraPicker = true },
                 onWebAttachment: { showWebURLAlert = true },
-                onVoiceInput: { toggleVoiceInput() },
+                // Voice call — gated by permissions.chat.call
+                onVoiceInput: dependencies.authViewModel.chatPermissions.call ? { toggleVoiceInput() } : nil,
                 apiClient: dependencies.apiClient,
                 notesManager: dependencies.notesManager,
                 conversationManager: dependencies.conversationManager,
@@ -1017,7 +1363,8 @@ struct ChatDetailView: View {
                 skills: viewModel.availableSkills,
                 selectedSkillIds: $viewModel.selectedSkillIds,
                 isLoadingSkills: viewModel.isLoadingSkills,
-                onDictationStart: { startDictation() },
+                // Dictation — gated by permissions.chat.stt
+                onDictationStart: dependencies.authViewModel.chatPermissions.stt ? { startDictation() } : nil,
                 onDictationStop: { stopDictation() },
                 onDictationCancel: { cancelDictation() },
                 isDictating: isDictating,
@@ -1032,7 +1379,12 @@ struct ChatDetailView: View {
                 messageQueue: vm.messageQueue,
                 onQueueSendNow: { id in viewModel.sendQueuedMessageNow(id: id) },
                 onQueueEdit: { id in viewModel.editQueuedMessage(id: id) },
-                onQueueDelete: { id in viewModel.deleteQueuedMessage(id: id) }
+                onQueueDelete: { id in viewModel.deleteQueuedMessage(id: id) },
+                isToolPermissionsEnabled: vm.isToolPermissionsEnabled && !vm.isTemporaryChat,
+                toolApprovalMode: vm.toolApprovalMode,
+                onToolApprovalModeChange: { mode in
+                    Task { await viewModel.handleToolApprovalModeChange(to: mode) }
+                }
             )
         }
         .background(theme.background)
@@ -1075,6 +1427,7 @@ struct ChatDetailView: View {
         .onChange(of: mentionedModel) { _, newModel in
             viewModel.mentionedModelId = newModel?.id
         }
+        ) // end AnyView(VStack)
     }
 
     private var photoPickerLabel: some View {
@@ -1156,28 +1509,39 @@ struct ChatDetailView: View {
             scrollContent
 
             // Welcome screen — shown when no messages and not loading.
-            // The .transition(.opacity) + .animation on messages.isEmpty makes
-            // the welcome screen (with starter prompt cards) gently crossfade out
-            // as the first message's chat view fades in — instead of an abrupt cut.
             if !viewModel.isLoadingConversation && viewModel.messages.isEmpty {
-                Group {
-                    if let folder = _folderWorkspace {
-                        folderWelcomeView(folder: folder)
-                    } else {
-                        welcomeView
-                    }
+                if let folder = _folderWorkspace {
+                    folderWelcomeView(folder: folder)
+                        .transaction { $0.animation = nil }
+                } else {
+                    welcomeView
+                        .transaction { $0.animation = nil }
                 }
-                .transition(.opacity)
             }
         }
-        .animation(MicroAnimation.gentle, value: viewModel.messages.isEmpty)
+        // ── Opacity curtain ──────────────────────────────────────────────────
+        // Keep the entire message area invisible until:
+        //   • Messages are loaded AND positioned at the bottom (existing chats), OR
+        //   • Load completes with no messages (new chat — show welcome instantly).
+        // This eliminates the three-stage glitch: skeleton → messages appear at top
+        // → visible scroll-to-bottom animation. The user sees only the final state.
+        // isContentReady is set in handleViewTask() after the 150ms settle + scrollTo.
+        // It resets to false automatically on each new ChatDetailView instance because
+        // every conversation gets a unique .id() key in MainChatView / iPadMainChatView.
+        //
+        // New chats (initialConversationId == nil) bypass the curtain entirely —
+        // there are no messages to position, so the welcome hero should render
+        // visible from frame 1 with no blank-screen flash.
+        .opacity((isContentReady || initialConversationId == nil) ? 1 : 0)
+        .blur(radius: (isContentReady || initialConversationId == nil) ? 0 : 8)
+        .animation(.easeOut(duration: 0.2), value: isContentReady)
 
         // FAB overlay — attached pill group: ↑ (top half) + ↓ (bottom half) when scrolled away from bottom.
         // Both appear together as one unit. ↑ is hidden when already at the very top.
         .overlay(alignment: .bottomTrailing) {
             scrollFABGroup
-                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isScrolledUp)
-                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isAtTop)
+                .animation(MicroAnimation.presence, value: isScrolledUp)
+                .animation(MicroAnimation.presence, value: isAtTop)
         }
         .onAppear {
             // Snap instantly to bottom on chat open.
@@ -1247,9 +1611,21 @@ struct ChatDetailView: View {
                 withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) {
                     scrollPosition.scrollTo(edge: .bottom)
                 }
+            } else if lastMessage?.role == .user {
+                // Animate the sent message gliding up to the top. Arm suppression
+                // first so the in-flight offset changes don't misfire the nav-bar /
+                // breakout observer while the spring is running.
+                _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.7)
+                Task { @MainActor in
+                    // 80ms settle: gives the layout engine one pass to measure the
+                    // new bubble + empty assistant placeholder before the spring fires.
+                    try? await Task.sleep(nanoseconds: 80_000_000)
+                    withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) {
+                        scrollPosition.scrollTo(edge: .bottom)
+                    }
+                }
             }
-            // else: already at bottom — .defaultScrollAnchor(.bottom) handles new content
-            // silently. No explicit scroll needed (would fight the anchor and cause a jump).
+            // else: assistant addition already at bottom — .defaultScrollAnchor(.bottom) handles it.
         }
         // Streaming start/end: manage auto-scroll state.
         // When streaming STARTS with streamingAutoScroll enabled, re-engage and jump to bottom.
@@ -1260,8 +1636,12 @@ struct ChatDetailView: View {
         .onChange(of: viewModel.isStreaming) { oldStreaming, newStreaming in
             if newStreaming && streamingAutoScroll {
                 // Stream started — re-engage auto-scroll.
-                // Arm suppression window BEFORE scrollTo so the resulting offset
-                // change never triggers the nav bar hide/show logic.
+                // Use an instant snap (no withAnimation) so there is no in-flight
+                // Core Animation competing with the user's touch when they try to
+                // scroll up during streaming. The sent-message spring fired ~100ms
+                // earlier has already glided the question to the top; at this point
+                // the response placeholder is just appearing so the scroll distance
+                // is negligible and the instant jump is invisible.
                 isScrolledUp = false
                 isUserDriving = false
                 _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.4)
@@ -1301,48 +1681,185 @@ struct ChatDetailView: View {
     private var scrollContent: some View {
         ScrollView {
             VStack(spacing: 0) {
-                if viewModel.isLoadingConversation {
-                    // A2: crossfade instead of hard-swap so the transition
-                    // between skeleton placeholders and real message content
-                    // is smooth and hides the single layout frame where
-                    // WKWebViews / MarkdownView first measure themselves.
-                    loadingPlaceholders
-                        .transition(.opacity)
-                } else {
-                    messagesList
-                        .transition(.opacity)
-                }
+                // Skeleton placeholders removed — the opacity curtain (isContentReady)
+                // already hides the area during loading, so there is no need to render
+                // and then crossfade out a skeleton. Showing only messagesList here
+                // eliminates the stutter caused by the VStack structural swap
+                // (4 skeleton rows → N message rows) that happened even under opacity 0.
+                messagesList
             }
-            .animation(.easeInOut(duration: 0.18), value: viewModel.isLoadingConversation)
-            .padding(.top, 8)
-            .padding(.bottom, 8)
-            .frame(maxWidth: iPadMaxContentWidth)
-            .frame(maxWidth: .infinity)
+        .padding(.top, 8)
+        .padding(.bottom, 8)
+        .frame(maxWidth: iPadMaxContentWidth)
+        .frame(maxWidth: .infinity)
+        // Hard-cap the entire messages VStack to the current device's screen width.
+        // This prevents ANY child — user bubbles, assistant text, tool calls, follow-ups,
+        // source bars, SVGs, etc. — from pushing the ScrollView content wider than the
+        // screen, regardless of which device the chat was originally created on.
+        // Anything that would overflow is clipped inside its own component rather than
+        // stretching the parent scroll view horizontally.
+        .frame(maxWidth: UIScreen.main.bounds.width, alignment: .leading)
+        .clipped()
         }
+        // defaultScrollAnchor(.bottom): tells SwiftUI to render the ScrollView
+        // with its initial content offset at the bottom on first appearance.
+        // This is a one-shot initial-position hint — it does NOT continuously
+        // pin to the bottom during streaming (that's handled by the pump).
+        // Combined with the opacity curtain, the user sees the chat already at
+        // the bottom on reveal, with no programmatic scroll animation at all.
+        .defaultScrollAnchor(.bottom)
+        .scrollContentBackground(.hidden)
         .background(ScrollViewHorizontalLock())
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(editingMessageId != nil ? .never : (viewModel.isStreaming ? .immediately : .interactively))
-        .defaultScrollAnchor(.bottom)
         .scrollPosition($scrollPosition)
         .onScrollPhaseChange { _, newPhase in
-            isUserDriving = (newPhase == .interacting || newPhase == .decelerating)
+            // isUserDriving: yield the streaming pump to BOTH finger touch AND inertia/deceleration.
+            // This prevents the pump from fighting the user during a flick-scroll.
+            //
+            // IMPORTANT: Do NOT reset isUserDriving when the new phase is .animating.
+            // When the streaming pump fires scrollPosition.scrollTo(edge: .bottom), it
+            // transitions the scroll phase to .animating — which would immediately reset
+            // isUserDriving = false, unblocking the pump again on the very next frame.
+            // That creates a frame-by-frame fight: finger scrolls up one frame, pump snaps
+            // back the next, finger moves again, repeat — producing choppy "stuck" scrolling.
+            // By treating .animating as a no-op here, a user-initiated isUserDriving = true
+            // survives across pump-triggered .animating transitions and stays true until
+            // the scroll genuinely reaches .idle (no motion) or the user lifts their finger
+            // and inertia finishes (.decelerating → .idle).
+            switch newPhase {
+            case .interacting, .decelerating:
+                isUserDriving = true
+            case .idle:
+                isUserDriving = false
+            case .animating:
+                // A programmatic scrollTo() just fired (either the streaming pump or a
+                // FAB tap). Do NOT change isUserDriving — if the user was driving before
+                // this programmatic scroll, keep the pump suppressed.
+                break
+            default:
+                isUserDriving = false
+            }
+            // isDecelerating: true while iOS is coasting after the user lifts their finger.
+            // The streaming pump must NOT fire during deceleration — each programmatic
+            // scrollTo() cancels the OS momentum curve, killing the natural coast-to-stop.
+            // Only set true for .decelerating; cleared on .idle (motion stopped) and
+            // .interacting (new touch began, finger overrides inertia anyway).
+            // .animating is left unchanged — a programmatic scroll during ongoing
+            // deceleration should not reset the flag (very rare race, defensive).
+            switch newPhase {
+            case .decelerating:
+                isDecelerating = true
+                // During streaming: the moment the user lifts their finger and iOS starts
+                // coasting, permanently lock out the pump by setting isScrolledUp = true.
+                // Without this, isDecelerating blocks the pump DURING the coast, but the
+                // moment deceleration finishes (.idle → isDecelerating = false), the pump
+                // immediately resumes and snaps content back to the streaming bottom —
+                // exactly the "flick then snap back" behaviour shown in the video.
+                // Setting isScrolledUp here keeps the pump suppressed after deceleration
+                // until the user explicitly taps the ↓ FAB to re-engage auto-scroll.
+                if viewModel.isStreaming && !isScrolledUp {
+                    isScrolledUp = true
+                }
+            case .idle, .interacting:
+                isDecelerating = false
+            case .animating:
+                break
+            default:
+                isDecelerating = false
+            }
+            // isFingerDriving: ONLY set while the finger is physically on screen (.interacting).
+            // The nav-bar and isScrolledUp upward-delta logic use this flag, NOT isUserDriving,
+            // so that inertia deceleration + bottom-bounce recovery never trigger jittery
+            // nav-bar hide/show or false isScrolledUp trips at the bottom edge.
+            isFingerDriving = (newPhase == .interacting)
         }
-        .onScrollGeometryChange(for: CGPoint.self) { geo in
-            geo.contentOffset
-        } action: { oldOffset, newOffset in
+        // ── Direct finger break-out ──────────────────────────────────────────
+        // When the glide animation is running the scroll phase is `.animating`,
+        // not `.interacting`, so isUserDriving never latches and the upward-drag
+        // breakout path in the offset handler never fires.  A simultaneous
+        // DragGesture side-steps the phase entirely: the moment the finger
+        // moves ≥4pt we set isUserDriving = true (stops the next glide tick)
+        // and, on an upward drag (positive height = moving down on screen =
+        // scrolling up through content), we set isScrolledUp = true directly.
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 4)
+                .onChanged { value in
+                    if !isUserDriving {
+                        isUserDriving = true
+                        // Lift the programmatic suppression window so the offset
+                        // handler immediately treats this as a genuine user scroll.
+                        _pumpRef.programmaticScrollUntil = .distantPast
+                    }
+                    // Positive height = finger moved down the screen = scrolling up.
+                    if value.translation.height > 8 && !isScrolledUp {
+                        isScrolledUp = true
+                    }
+                }
+        )
+        // ── UNIFIED SCROLL GEOMETRY CALLBACK ─────────────────────────────────────────
+        //
+        // CRITICAL: This replaces the previous two separate callbacks (one for CGPoint
+        // offset, one for CGSize content/container). The old design had a race condition:
+        // the offset callback used @State viewState_contentHeight / viewState_containerHeight
+        // which could be 1-2 frames stale relative to the current offset. This caused
+        // isBouncing to compute incorrectly during rubber-band overscroll — it would
+        // return false during a real bounce, letting nav-bar and FAB logic fire at 120Hz
+        // on oscillating offsets, producing the violent jitter at the bottom edge.
+        //
+        // The fix: capture contentSize and containerSize in the SAME geometry snapshot
+        // as contentOffset, so all three values are atomically consistent. isBouncing is
+        // computed from the live snapshot, never from stale @State.
+        //
+        // Additionally, nav-bar hide/show and the upward-delta isScrolledUp trip now use
+        // `isFingerDriving` (finger physically on screen) instead of `isUserDriving`
+        // (finger OR inertia). This prevents bottom-bounce deceleration — which is
+        // .decelerating phase, NOT .interacting — from triggering nav-bar jitter.
+        .onScrollGeometryChange(for: ScrollSnapshot.self) { geo in
+            ScrollSnapshot(
+                offset: geo.contentOffset,
+                contentSize: geo.contentSize,
+                containerSize: geo.containerSize
+            )
+        } action: { oldSnap, snap in
+            let newOffset = snap.offset
+            let oldOffset = oldSnap.offset
+            let contentHeight = snap.contentSize.height
+            let containerHeight = snap.containerSize.height
+
+            // ── Update @State size caches (used by messagesList minHeight, FAB reference) ──
+            // These writes cause a SwiftUI re-eval, but only when the height actually changes
+            // (the >1pt dead-band eliminates sub-pixel noise). They are still needed because
+            // messagesList.frame(minHeight:) and the FAB reference height use @State.
+            if abs(contentHeight - viewState_contentHeight) > 1 {
+                viewState_contentHeight = contentHeight
+            }
+            if abs(containerHeight - viewState_containerHeight) > 1 {
+                viewState_containerHeight = containerHeight
+            }
+
             // Track raw offset for the ↑ FAB "find current question" logic.
-            currentScrollOffsetY = newOffset.y
+            // Written to _pumpRef (not @State) so this 120Hz write never causes a body re-eval.
+            _pumpRef.currentScrollOffsetY = newOffset.y
 
-            let distanceFromBottom = max(0,
-                viewState_contentHeight - newOffset.y - viewState_containerHeight)
-            let maxScrollOffset = max(0, viewState_contentHeight - viewState_containerHeight)
-            let isBouncing = newOffset.y < 0 || (maxScrollOffset > 0 && newOffset.y > maxScrollOffset)
+            // ── isBouncing: computed from the LIVE snapshot — never stale @State ──
+            // maxScrollOffset is the furthest the content can scroll before rubber-banding.
+            // isBouncing is true when the offset is past either edge (top overscroll < 0,
+            // bottom overscroll > maxScrollOffset). A 1pt tolerance prevents floating-point
+            // at-exact-bottom from being treated as a bounce.
+            let maxScrollOffset = max(0, contentHeight - containerHeight)
+            let isBouncing = newOffset.y < 0 || (maxScrollOffset > 0 && newOffset.y > maxScrollOffset + 1)
 
-            if distanceFromBottom <= 80 && !isBouncing {
-                // Scrolled to within 80pt of the bottom — re-engage auto-scroll and hide FABs.
-                // !isBouncing guard: during a bottom bounce newOffset.y overshoots maxScrollOffset,
-                // which clamps distanceFromBottom to 0 — without this guard it fires isScrolledUp=false
-                // which triggers scrollTo(edge:.bottom) via onChange and causes the "fighting" sensation.
+            let distanceFromBottom = max(0, contentHeight - newOffset.y - containerHeight)
+
+            // Arm the programmatic-scroll suppression flag once so all logic below shares it.
+            let programmaticActive = Date() < _pumpRef.programmaticScrollUntil
+
+            // ── Near-bottom reset: re-engage auto-scroll when finger scrolls back down ──
+            // Threshold tightened to 40pt (was 80pt) so this only fires when clearly at
+            // the bottom and NOT during bounce recovery. The isBouncing guard is the primary
+            // protection; 40pt provides an additional safety margin.
+            if distanceFromBottom <= 40 && !isBouncing && !programmaticActive && !viewModel.isStreaming {
                 if isScrolledUp {
                     isScrolledUp = false
                     userMessageJumpIndex = nil
@@ -1350,10 +1867,6 @@ struct ChatDetailView: View {
             } else if isUserDriving && !isBouncing {
                 // User's finger (or inertia) is actively driving the scroll view —
                 // the ONLY condition under which auto-scroll is allowed to disengage.
-                // !isBouncing already covers the rubber-band over-scroll zones (top/bottom),
-                // so no distance gate is needed — any genuine upward drag breaks auto-scroll
-                // instantly, even a tiny one. This makes the breakout feel immediate rather
-                // than requiring the user to fight/scroll >80pt against the streaming pump.
                 // Require a small delta (>2pt) so sub-pixel layout reflow/settling noise
                 // never falsely trips the breakout.
                 let upwardDelta = oldOffset.y - newOffset.y
@@ -1362,40 +1875,34 @@ struct ChatDetailView: View {
             // All other cases (layout reflows, programmatic scrolls, WKWebView resizes)
             // emit .animating/.idle → isUserDriving is false → no state change.
 
-
             // ── Nav bar direction-based hide/show ──
-            // HIDE: genuine downward finger/inertia scroll, more than 80pt from the bottom.
-            // SHOW: genuine upward finger/inertia scroll.
+            // Uses isFingerDriving (NOT isUserDriving) so that:
+            //   • Inertia deceleration and bounce recovery (.decelerating phase) NEVER
+            //     trigger nav-bar changes — that was the primary source of bottom-edge jitter.
+            //   • Only actual finger-contact scrolls (.interacting phase) hide/show the bar.
             //
-            // "Genuine" = isUserDriving AND not in a programmatic-scroll suppression window.
-            // The suppression window is armed before every scrollTo() call so that FAB taps,
-            // streaming auto-scroll, stream-start re-engagement, and AnimatedPresence reflow
-            // never trigger the nav bar. Without suppression those events all emit offset
-            // changes that hit the navDelta > 1 hide path and the old unconditional
-            // "near-bottom → show" path, causing the visible pop/flash.
-            //
-            // Always keep lastNavBarOffsetY in sync so the first real drag after a
-            // programmatic scroll gets a correct baseline delta.
-            let navSuppressed = Date() < _pumpRef.programmaticScrollUntil
-            let navDelta = newOffset.y - _pumpRef.lastNavBarOffsetY
-            _pumpRef.lastNavBarOffsetY = newOffset.y
+            // Nav-bar baseline is only updated when NOT bouncing.
+            // During a bottom overscroll the offset oscillates around maxScrollOffset —
+            // freezing the baseline during bounce keeps the delta near zero, so the
+            // nav bar stays completely still during overscroll recovery.
+            if !isBouncing {
+                let navSuppressed = Date() < _pumpRef.programmaticScrollUntil
+                let navDelta = newOffset.y - _pumpRef.lastNavBarOffsetY
+                _pumpRef.lastNavBarOffsetY = newOffset.y
 
-            // Freeze nav bar during streaming — every streaming auto-scroll fires offset
-            // changes that would otherwise toggle the nav bar, causing the visible
-            // pop-in/pop-out the user reported. Only respond to genuine user drags.
-            if !navSuppressed && isUserDriving && !viewModel.isStreaming && !isBouncing {
-                if distanceFromBottom > 80 {
-                    if navDelta > 1 && !navBarHidden {
-                        // Scrolling down (away from bottom) — hide
-                        withAnimation(.easeInOut(duration: 0.2)) { navBarHidden = true }
-                    } else if navDelta < -1 && navBarHidden {
-                        // Scrolling up (back toward top) — show
-                        withAnimation(.easeInOut(duration: 0.2)) { navBarHidden = false }
-                    }
-                } else {
-                    // Near/at the bottom with real user scroll upward — show
-                    if navDelta < -1 && navBarHidden {
-                        withAnimation(.easeInOut(duration: 0.2)) { navBarHidden = false }
+                // Only respond to genuine finger-contact drags, not inertia or streaming pump.
+                if !navSuppressed && isFingerDriving && !viewModel.isStreaming {
+                    if distanceFromBottom > 80 {
+                        if navDelta > 1 && !navBarHidden {
+                            withAnimation(.easeInOut(duration: 0.2)) { navBarHidden = true }
+                        } else if navDelta < -1 && navBarHidden {
+                            withAnimation(.easeInOut(duration: 0.2)) { navBarHidden = false }
+                        }
+                    } else {
+                        // Near/at bottom with finger scrolling upward — show bar
+                        if navDelta < -1 && navBarHidden {
+                            withAnimation(.easeInOut(duration: 0.2)) { navBarHidden = false }
+                        }
                     }
                 }
             }
@@ -1405,47 +1912,35 @@ struct ChatDetailView: View {
             if atTop != isAtTop { isAtTop = atTop }
 
             // ── Track topmost visible message for layout-stable scroll restore ──
-            // Estimate which message ID is currently at the top of the viewport
-            // using a linear fraction of the scroll offset. This is updated
-            // continuously so we always have a fresh ID ready when streaming ends.
             if isScrolledUp {
                 let allMsgs = viewModel.messages
-                if !allMsgs.isEmpty && viewState_contentHeight > 0 {
-                    let fraction = max(0, min(1, newOffset.y / viewState_contentHeight))
+                if !allMsgs.isEmpty && contentHeight > 0 {
+                    let fraction = max(0, min(1, newOffset.y / contentHeight))
                     let estimatedIdx = min(Int(fraction * CGFloat(allMsgs.count)), allMsgs.count - 1)
-                    let newTopId = allMsgs[estimatedIdx].id
-                    if newTopId != topmostVisibleMessageId {
-                        topmostVisibleMessageId = newTopId
-                    }
+                    _pumpRef.topmostVisibleMessageId = allMsgs[estimatedIdx].id
                 }
             }
 
-            // ── Sliding window: load older messages when near the top ──
+            // ── Sliding window: preload older messages when approaching the top ──
             let total = viewModel.messages.count
             let effectiveEnd = windowEnd ?? total
             let effectiveStart = max(0, effectiveEnd - windowSize)
 
-            if newOffset.y < 200,
+            if newOffset.y < 600,
                !isLoadingMoreMessages,
+               !programmaticActive,
                effectiveStart > 0,
                !viewModel.isLoadingConversation {
-                // Bug 12: set isLoadingMoreMessages = true synchronously BEFORE the
-                // async dispatch so the streaming scroll handler sees it immediately
-                // and skips the bottom-scroll that would race with the anchor scroll.
                 isLoadingMoreMessages = true
-                let anchorId = viewModel.messages[effectiveStart].id
-                let slideBy = min(5, effectiveStart)
+                let capturedTotal = total
+                let capturedEffectiveStart = effectiveStart
 
-                // Detach from "pinned to latest" on first upward scroll
-                if windowEnd == nil { windowEnd = total }
-
-                // Slide window backwards: keep size capped, shift windowEnd so start moves up
-                windowSize = min(windowSize + slideBy, maxWindowSize)
-                let newStart = max(0, effectiveStart - slideBy)
-                windowEnd = min(newStart + windowSize, total)
-
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    scrollPosition.scrollTo(id: anchorId, anchor: .top)
+                Task { @MainActor in
+                    let slideBy = min(5, capturedEffectiveStart)
+                    if windowEnd == nil { windowEnd = capturedTotal }
+                    windowSize = min(windowSize + slideBy, maxWindowSize)
+                    let newStart = max(0, capturedEffectiveStart - slideBy)
+                    windowEnd = min(newStart + windowSize, capturedTotal)
                     isLoadingMoreMessages = false
                 }
             }
@@ -1454,13 +1949,12 @@ struct ChatDetailView: View {
             if let wEnd = windowEnd, wEnd < total,
                distanceFromBottom < 200,
                !isLoadingMoreMessages,
+               !programmaticActive,
                !viewModel.isLoadingConversation {
                 isLoadingMoreMessages = true
                 let anchorId = viewModel.messages[min(wEnd - 1, total - 1)].id
                 let slideBy = min(5, total - wEnd)
                 windowEnd = wEnd + slideBy
-
-                // Re-pin to latest when we've scrolled all the way back down
                 if windowEnd! >= total { windowEnd = nil }
 
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
@@ -1468,40 +1962,18 @@ struct ChatDetailView: View {
                     isLoadingMoreMessages = false
                 }
             }
-        }
-        .onScrollGeometryChange(for: CGSize.self) { geo in
-            CGSize(width: geo.contentSize.height, height: geo.containerSize.height)
-        } action: { oldSize, newSize in
-            if abs(newSize.width - viewState_contentHeight) > 1 {
-                viewState_contentHeight = newSize.width
-            }
-            if abs(newSize.height - viewState_containerHeight) > 1 {
-                viewState_containerHeight = newSize.height
-            }
-            // Streaming auto-follow:
-            // .defaultScrollAnchor(.bottom) + .scrollPosition(anchor:.bottom) pin the
-            // bottom edge as content grows. When a correction is needed, we snap instantly
-            // (no animation) so the viewport moves in the SAME frame as the new text
-            // appears. Wrapping this in withAnimation(.easeOut) caused the viewport to
-            // lag 0.18s behind the content, making the text and scroll move at different
-            // speeds — the "motion blur / motion sickness" smear the user reported.
-            //
-            // The 24pt dead-band prevents sub-pixel noise from firing a correction on
-            // every floating-point rounding fluctuation in the geometry callback.
-            let contentHeight = newSize.width
-            let containerHeight = newSize.height
-            let distFromBottom = max(0, contentHeight - containerHeight - currentScrollOffsetY)
-            let driftedFar = distFromBottom > 24
-            if driftedFar && viewModel.isStreaming && !isScrolledUp && !isLoadingMoreMessages {
-                // Short linear glide (~0.1s) smooths the per-line-quantum height jumps
-                // (~20pt each) without accumulating lag behind the text. Linear (not easeOut)
-                // ensures consecutive line-wraps chain into one continuous uniform slide.
-                // Arm suppression window so the animation's deceleration phase never
-                // falsely flips isScrolledUp = true via the offset observer.
-                _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.15)
-                withAnimation(.linear(duration: 0.1)) {
-                    scrollPosition.scrollTo(edge: .bottom)
-                }
+
+            // ── Streaming auto-follow pump ──
+            // Rate-limited instant snap — keeps viewport glued to the live tail during streaming.
+            // Guards: not user-driving, not manually scrolled up, not paginating.
+            let distFromBottom = max(0, contentHeight - containerHeight - newOffset.y)
+            let driftedFar = distFromBottom > 4
+            if driftedFar && viewModel.isStreaming && !isUserDriving && !isDecelerating && !isScrolledUp && !isLoadingMoreMessages {
+                let now = Date()
+                guard now.timeIntervalSince(_pumpRef.lastScrollTime) >= 0.016 else { return }
+                _pumpRef.lastScrollTime = now
+                _pumpRef.programmaticScrollUntil = now.addingTimeInterval(0.06)
+                scrollPosition.scrollTo(edge: .bottom)
             }
         }
     }
@@ -1532,37 +2004,62 @@ struct ChatDetailView: View {
                                 targetIdx = userIndices.first!
                             }
                         } else {
-                            // First tap: find the user message whose index is at or just above
-                            // the current viewport top. We estimate the message index linearly
-                            // from the scroll offset — good enough for direction, not pixel-perfect.
-                            // total here is the full message count (allMessages.count), not the window.
-                            let estimatedMsgIdx: Int = {
+                            // First tap: use topmostVisibleMessageId (updated continuously by
+                            // the scroll-offset handler) as the reference — version-agnostic
+                            // and accurate regardless of window size or message branching.
+                            let refIdx: Int = {
+                                if let topId = _pumpRef.topmostVisibleMessageId,
+                                   let idx = allMessages.firstIndex(where: { $0.id == topId }) {
+                                    return idx
+                                }
+                                // Fallback: linear fraction estimate
                                 guard viewState_contentHeight > 0 else { return allMessages.count - 1 }
-                                let fraction = currentScrollOffsetY / viewState_contentHeight
+                                let fraction = _pumpRef.currentScrollOffsetY / viewState_contentHeight
                                 return Int(fraction * CGFloat(allMessages.count))
                             }()
-                            // Find the last user message at or before the estimated viewport top.
+                            // Find the last user message at or before the reference index.
                             // This is the "current context" question — the one whose answer
                             // the user is likely reading.
-                            if let pos = userIndices.lastIndex(where: { $0 <= estimatedMsgIdx }) {
+                            if let pos = userIndices.lastIndex(where: { $0 <= refIdx }) {
                                 targetIdx = userIndices[pos]
                             } else {
-                                // Estimated index is before any user message — jump to first
+                                // Reference index is before any user message — jump to first
                                 targetIdx = userIndices.first!
                             }
                         }
                         userMessageJumpIndex = targetIdx
 
-                        // Expand the window to include this message if needed
+                        // Expand the window to include this message if needed.
+                        // IMPORTANT: arm programmaticScrollUntil BEFORE mutating windowEnd/windowSize.
+                        // The window mutation drops the newest messages from the rendered list, which
+                        // causes a momentary content-height drop. Without suppression the geometry
+                        // callback interprets that as "scrolled to bottom" and fires isScrolledUp=false,
+                        // hiding the FABs and nulling userMessageJumpIndex. 0.8s covers the 30ms defer
+                        // plus the full 0.45s spring settle plus layout stabilisation margin.
                         let total = allMessages.count
-                        if windowEnd != nil || targetIdx < max(0, (windowEnd ?? total) - windowSize) {
+                        let currentEffectiveStart = max(0, (windowEnd ?? total) - windowSize)
+                        let needsExpand = targetIdx < currentEffectiveStart
+                        // Suppress the geometry handler for all programmatic jumps (expand or not) so
+                        // the spring animation offset never falsely trips the near-bottom reset.
+                        _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.8)
+                        if needsExpand {
                             windowEnd = min(targetIdx + windowSize, total)
                             if windowEnd! > total { windowEnd = nil }
                             windowSize = min(maxWindowSize, total)
-                        }
-
-                        withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
-                            scrollPosition.scrollTo(id: allMessages[targetIdx].id, anchor: UnitPoint(x: 0.5, y: 0))
+                            // Defer scroll by one tick so newly-mounted rows are in the
+                            // view hierarchy before scrollTo(id:) fires — otherwise it
+                            // silently no-ops on IDs not yet rendered.
+                            let targetId = allMessages[targetIdx].id
+                            Task { @MainActor in
+                                try? await Task.sleep(nanoseconds: 30_000_000) // 30ms
+                                withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                                    scrollPosition.scrollTo(id: targetId, anchor: UnitPoint(x: 0.5, y: 0))
+                                }
+                            }
+                        } else {
+                            withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                                scrollPosition.scrollTo(id: allMessages[targetIdx].id, anchor: UnitPoint(x: 0.5, y: 0))
+                            }
                         }
                         Haptics.play(.light)
                     } label: {
@@ -1590,7 +2087,11 @@ struct ChatDetailView: View {
                     isScrolledUp = false
                     userMessageJumpIndex = nil
                     windowEnd = nil
-                    windowSize = min(maxWindowSize, viewModel.messages.count)
+                    // Do NOT expand windowSize here — mounting the full maxWindowSize
+                    // worth of Litext/MarkdownView rows synchronously in one frame
+                    // causes a 2-second hang. Keep the window at its current size;
+                    // the sliding-window pagination handler will grow it naturally
+                    // if the user scrolls up after returning to the bottom.
                     if viewModel.isStreaming {
                         // During streaming, DON'T use a spring animation.
                         // A 0.45s spring fights the per-token linear pump (which fires
@@ -1601,8 +2102,15 @@ struct ChatDetailView: View {
                         _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.1)
                         scrollPosition.scrollTo(edge: .bottom)
                     } else {
-                        _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.5)
+                        _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.6)
                         withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                            scrollPosition.scrollTo(edge: .bottom)
+                        }
+                        // Settle correction: heavy bottom messages may not be fully measured
+                        // when the spring fires, so the spring targets a position that's short
+                        // of the true bottom. Re-snap to the real bottom after heights settle.
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 400_000_000) // 400ms settle
                             scrollPosition.scrollTo(edge: .bottom)
                         }
                     }
@@ -1634,7 +2142,7 @@ struct ChatDetailView: View {
                     insertion: .scale(scale: 0.7).combined(with: .opacity),
                     removal: .scale(scale: 0.7).combined(with: .opacity)
                 )
-                .animation(.spring(response: 0.3, dampingFraction: 0.7))
+                .animation(MicroAnimation.presence)
             )
         }
     }
@@ -1680,8 +2188,10 @@ struct ChatDetailView: View {
         // (messages are append-only so indices are stable until a deletion).
         // Avoid mutating @State directly during view update — compute locally and
         // schedule the cache update for after the current render pass.
+        //
+        let lastMsgId = allMessages.last?.id ?? ""
         let indexMap: [String: Int]
-        if cachedIndexMap.count == total && !cachedIndexMap.isEmpty {
+        if cachedIndexMap.count == total && !cachedIndexMap.isEmpty && cachedIndexMap[lastMsgId] != nil {
             indexMap = cachedIndexMap
         } else {
             let freshMap = Dictionary(allMessages.enumerated().map { ($1.id, $0) },
@@ -1714,7 +2224,9 @@ struct ChatDetailView: View {
                 let index = indexMap[message.id] ?? 0
                 messageRow(message: message, index: index)
                     .id(message.id)
+                    .transition(.opacity)
             }
+            .animation(.easeInOut(duration: 0.2), value: messages.prefix(splitAt).map(\.id))
 
             // ── Last turn (user msg + assistant reply) with minHeight ──
             if splitAt < messages.count {
@@ -1723,6 +2235,7 @@ struct ChatDetailView: View {
                         let index = indexMap[message.id] ?? 0
                         messageRow(message: message, index: index)
                             .id(message.id)
+                            .transition(.opacity)
                     }
                 }
                 .frame(minHeight: windowIncludesEnd ? max(viewState_containerHeight, 0) : nil,
@@ -1742,8 +2255,60 @@ struct ChatDetailView: View {
 
     // MARK: - Message Row
 
+    // MARK: - Background Sub-agent Completion Banner
+
+    @ViewBuilder
+    private func subagentCompletionBanner(message: ChatMessage) -> some View {
+        let delegationId = message.subagentDelegationId ?? ""
+        let shortId = delegationId.hasPrefix("deleg_") ? String(delegationId.dropFirst(6).prefix(8)) : String(delegationId.prefix(8))
+
+        Button {
+            subagentDetailMessage = message
+            Haptics.play(.light)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text("Background sub-agent finished")
+                    .font(.subheadline)
+                    .foregroundStyle(.primary)
+                Spacer()
+                if !shortId.isEmpty {
+                    Text(shortId)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(Color.secondary.opacity(0.2), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     @ViewBuilder
     private func messageRow(message: ChatMessage, index: Int) -> some View {
+        // Internal sub-agent completion messages get a compact banner, not a full bubble.
+        // The isInternalMessage flag is set from meta.internal on the server node, but as a
+        // safety net we also check the content prefix — OpenWebUI always injects these with
+        // "[ASYNC SUBAGENT COMPLETE" so we can identify them even if meta is missing/absent.
+        let isSubagentCompletion = (message.isInternalMessage || message.content.hasPrefix("[ASYNC SUBAGENT COMPLETE"))
+            && message.role == .user
+        if isSubagentCompletion {
+            subagentCompletionBanner(message: message)
+        } else {
+
         let isLastAssistant = message.role == .assistant && index == viewModel.messages.count - 1
 
         VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 0) {
@@ -1766,6 +2331,20 @@ struct ChatDetailView: View {
                     message: message,
                     isActiveStore: isActiveStatus
                 )
+            }
+
+            // ── User images (rendered ABOVE the text bubble, outside it) ──
+            if message.role == .user {
+                let userVIdxRow = activeUserVersionIndex[message.id] ?? -1
+                let userImgFiles: [ChatMessageFile] = {
+                    if userVIdxRow >= 0 && userVIdxRow < message.versions.count {
+                        return message.versions[userVIdxRow].files.filter { isImageFile($0) }
+                    }
+                    return message.files.filter { isImageFile($0) }
+                }()
+                if !userImgFiles.isEmpty {
+                    userImageMosaicGrid(imageFiles: userImgFiles)
+                }
             }
 
             // ── Message bubble / content ──
@@ -1849,13 +2428,7 @@ struct ChatDetailView: View {
             }
 
             // ── Follow-up suggestions (last assistant message only) ──
-            let vIdxFU = activeVersionIndex[message.id] ?? -1
-            let displayFollowUps: [String] = {
-                if vIdxFU >= 0 && vIdxFU < message.versions.count {
-                    return message.versions[vIdxFU].followUps
-                }
-                return message.followUps
-            }()
+            let displayFollowUps: [String] = message.followUps
             AnimatedPresence(visible: isLastAssistant && !message.isStreaming && !displayFollowUps.isEmpty) {
                 if isLastAssistant && !message.isStreaming && !displayFollowUps.isEmpty {
                     followUpSuggestions(displayFollowUps)
@@ -1867,6 +2440,7 @@ struct ChatDetailView: View {
         .clipped()
         .accessibilityElement(children: .combine)
         .accessibilityLabel(Text("\(message.role == .user ? "You" : "Assistant"): \(message.content.prefix(200))"))
+        } // end else (not internal message)
     }
 
     // MARK: - Assistant Header
@@ -1990,31 +2564,25 @@ struct ChatDetailView: View {
                 return message.files
             }()
 
-            VStack(alignment: .trailing, spacing: Spacing.sm) {
-                // Inline images inside the bubble
-                let imageFiles = displayFiles.filter { $0.type == "image" }
-                if !imageFiles.isEmpty {
-                    ForEach(Array(imageFiles.prefix(4).enumerated()), id: \.offset) { _, file in
-                        if let fileId = file.url, !fileId.isEmpty {
-                            AuthenticatedImageView(fileId: fileId, apiClient: dependencies.apiClient)
-                                .frame(maxWidth: 220, maxHeight: 220)
-                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            // Non-image file cards + text content
+            // Images are rendered ABOVE the bubble in messageRow — not inside it.
+            let nonImageFiles = displayFiles.filter { !isImageFile($0) && $0.type != "collection" && $0.type != "folder" }
+            let hasText = !displayContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+            if hasText || !nonImageFiles.isEmpty {
+                VStack(alignment: .trailing, spacing: Spacing.sm) {
+                    // Non-image file cards inside the bubble
+                    if !nonImageFiles.isEmpty {
+                        ForEach(Array(nonImageFiles.enumerated()), id: \.offset) { _, file in
+                            fileAttachmentCard(file: file)
                         }
                     }
-                }
 
-                // Non-image file cards inside the bubble
-                let nonImageFiles = displayFiles.filter { $0.type != "image" && $0.type != "collection" && $0.type != "folder" }
-                if !nonImageFiles.isEmpty {
-                    ForEach(Array(nonImageFiles.enumerated()), id: \.offset) { _, file in
-                        fileAttachmentCard(file: file)
+                    // Text content
+                    if hasText {
+                        UserMessageContentView(content: displayContent)
+                            .lineSpacing(2)
                     }
-                }
-
-                // Text content
-                if !displayContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    UserMessageContentView(content: displayContent)
-                        .lineSpacing(2)
                 }
             }
         } else {
@@ -2044,62 +2612,82 @@ struct ChatDetailView: View {
     /// Lives in the safeAreaInset bottom slot — exactly where the normal
     /// ChatInputField sits — so iOS keyboard avoidance just works.
     private var editInputBar: some View {
-        HStack(spacing: 10) {
-            // Cancel button
-            Button {
-                cancelInlineEdit()
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(theme.surfaceContainer)
-                        .frame(width: 34, height: 34)
-                    Image(systemName: "xmark")
-                        .scaledFont(size: 13, weight: .semibold)
-                        .foregroundStyle(theme.textSecondary)
+        VStack(spacing: 0) {
+            // ── Attachment strip — shown when the message had files ───────────
+            if !editingMessageFiles.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(Array(editingMessageFiles.enumerated()), id: \.offset) { idx, file in
+                            editFileChip(file: file) {
+                                var updated = editingMessageFiles
+                                updated.remove(at: idx)
+                                editingMessageFiles = updated
+                            }
+                        }
+                    }
+                    .padding(.horizontal, Spacing.md)
+                    .padding(.vertical, 8)
                 }
+                .background(theme.surfaceContainer.opacity(0.5))
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Cancel edit")
 
-            // Text field — fills remaining space, grows vertically up to 6 lines
-            TextField("Edit message…", text: $editingMessageText, axis: .vertical)
-                .scaledFont(size: 16)
-                .foregroundStyle(theme.textPrimary)
-                .tint(theme.brandPrimary)
-                .lineLimit(1...6)
-                .focused($isEditFieldFocused)
-                .submitLabel(.done)
-                .onSubmit {
-                    if !editingMessageText.contains("\n") { submitInlineEdit() }
+            HStack(spacing: 10) {
+                // Cancel button
+                Button {
+                    cancelInlineEdit()
+                } label: {
+                    ZStack {
+                        Circle()
+                            .fill(theme.surfaceContainer)
+                            .frame(width: 34, height: 34)
+                        Image(systemName: "xmark")
+                            .scaledFont(size: 13, weight: .semibold)
+                            .foregroundStyle(theme.textSecondary)
+                    }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(theme.surfaceContainer)
-                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .buttonStyle(.plain)
+                .accessibilityLabel("Cancel edit")
 
-            // Send / confirm button
-            Button {
-                submitInlineEdit()
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(editingMessageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              ? theme.textTertiary.opacity(0.3)
-                              : theme.brandPrimary)
-                        .frame(width: 34, height: 34)
-                    Image(systemName: "arrow.up")
-                        .scaledFont(size: 14, weight: .bold)
-                        .foregroundStyle(.white)
+                // Text field — fills remaining space, grows vertically up to 6 lines
+                TextField("Edit message…", text: $editingMessageText, axis: .vertical)
+                    .scaledFont(size: 16)
+                    .foregroundStyle(theme.textPrimary)
+                    .tint(theme.brandPrimary)
+                    .lineLimit(1...6)
+                    .focused($isEditFieldFocused)
+                    .submitLabel(.done)
+                    .onSubmit {
+                        if !editingMessageText.contains("\n") { submitInlineEdit() }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(theme.surfaceContainer)
+                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+
+                // Send / confirm button
+                Button {
+                    submitInlineEdit()
+                } label: {
+                    ZStack {
+                        Circle()
+                            .fill(editingMessageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  ? theme.textTertiary.opacity(0.3)
+                                  : theme.brandPrimary)
+                            .frame(width: 34, height: 34)
+                        Image(systemName: "arrow.up")
+                            .scaledFont(size: 14, weight: .bold)
+                            .foregroundStyle(.white)
+                    }
                 }
+                .buttonStyle(.plain)
+                .disabled(editingMessageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .accessibilityLabel("Save and resend")
             }
-            .buttonStyle(.plain)
-            .disabled(editingMessageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            .accessibilityLabel("Save and resend")
+            .padding(.horizontal, Spacing.md)
+            .padding(.top, 10)
+            .padding(.bottom, 10)
+            .background(theme.background)
         }
-        .padding(.horizontal, Spacing.md)
-        .padding(.top, 10)
-        .padding(.bottom, 10)
-        .background(theme.background)
         .overlay(alignment: .top) {
             Divider().opacity(0.5)
         }
@@ -2108,9 +2696,61 @@ struct ChatDetailView: View {
         }
     }
 
+    /// A chip shown in the edit attachment strip for one file.
+    /// Shows an image thumbnail (if image) or a file-name pill (otherwise),
+    /// with a × button to remove the attachment from the edit.
+    @ViewBuilder
+    private func editFileChip(file: ChatMessageFile, onRemove: @escaping () -> Void) -> some View {
+        let isImage = isImageFile(file)
+        ZStack(alignment: .topTrailing) {
+            if isImage, let fileId = file.url, !fileId.isEmpty {
+                AuthenticatedImageView(fileId: fileId, apiClient: dependencies.apiClient)
+                    .scaledToFill()
+                    .frame(width: 56, height: 56)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            } else {
+                HStack(spacing: 5) {
+                    Image(systemName: fileIconName(for: (file.name ?? "").components(separatedBy: ".").last?.lowercased() ?? ""))
+                        .scaledFont(size: 14, weight: .medium)
+                        .foregroundStyle(theme.brandPrimary)
+                    Text(file.name ?? "File")
+                        .scaledFont(size: 12, weight: .medium)
+                        .foregroundStyle(theme.textPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 100)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(theme.surfaceContainer)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(theme.cardBorder.opacity(0.4), lineWidth: 0.5)
+                )
+            }
+
+            // Remove button
+            Button(action: onRemove) {
+                ZStack {
+                    Circle()
+                        .fill(theme.textPrimary)
+                        .frame(width: 18, height: 18)
+                    Image(systemName: "xmark")
+                        .scaledFont(size: 8, weight: .bold)
+                        .foregroundStyle(theme.background)
+                }
+            }
+            .buttonStyle(.plain)
+            .offset(x: 4, y: -4)
+        }
+    }
+
     private func beginInlineEdit(message: ChatMessage) {
         editingMessageId = message.id
         editingMessageText = message.content
+        editingMessageFiles = message.files
         // Focus immediately — no delay needed since we're not fighting scroll layout
         isEditFieldFocused = true
         Haptics.play(.light)
@@ -2121,6 +2761,7 @@ struct ChatDetailView: View {
         withAnimation(.easeInOut(duration: 0.18)) {
             editingMessageId = nil
             editingMessageText = ""
+            editingMessageFiles = []
         }
     }
 
@@ -2129,18 +2770,23 @@ struct ChatDetailView: View {
         let trimmed = editingMessageText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         isEditFieldFocused = false
+        let filesToSend = editingMessageFiles
         withAnimation(.easeInOut(duration: 0.18)) {
             editingMessageId = nil
         }
         editingMessageText = ""
-        Task { await viewModel.editMessage(id: id, newContent: trimmed) }
+        editingMessageFiles = []
+        Task { await viewModel.editMessage(id: id, newContent: trimmed, files: filesToSend) }
         Haptics.play(.medium)
     }
 
     // MARK: - Welcome View
 
-    private struct SuggestedPrompt: Identifiable {
-        let id = UUID()
+    private struct SuggestedPrompt: Identifiable, Hashable {
+        /// Stable, content-derived ID so SwiftUI never treats an identical card as a new view.
+        /// Using a random UUID() caused every re-resolve to look like all-new items, triggering
+        /// insertion animations (left-to-right slide) even when the text was the same.
+        var id: String { "\(title)|\(subtitle)" }
         let title: String
         let subtitle: String
         private let _fullText: String?
@@ -2210,78 +2856,83 @@ struct ChatDetailView: View {
 
                 // ── Hero: avatar + greeting ──
                 VStack(spacing: Spacing.sm) {
-                ZStack {
-                    if let model = viewModel.selectedModel {
-                        ModelAvatar(
-                            size: 52,
-                            imageURL: viewModel.resolvedImageURL(for: model),
-                            label: model.shortName,
-                            authToken: viewModel.serverAuthToken
-                        )
-                        .transition(.scale.combined(with: .opacity))
-                    } else {
-                        ModelAvatar(size: 52, label: nil)
-                            .transition(.scale.combined(with: .opacity))
-                    }
-                }
-
-                VStack(spacing: 4) {
-                    Text("How can I help?")
-                        .scaledFont(size: 24, weight: .bold)
-                        .foregroundStyle(theme.textPrimary)
-
-                    if let model = viewModel.selectedModel {
-                        Text(model.shortName)
-                            .scaledFont(size: 13, weight: .medium)
-                            .foregroundStyle(theme.textTertiary)
-                    }
-                }
-
-                if viewModel.isTemporaryChat {
-                    HStack(spacing: 5) {
-                        Image(systemName: "eye.slash.fill")
-                            .scaledFont(size: 10, weight: .semibold)
-                        Text("Temporary Chat")
-                            .scaledFont(size: 11, weight: .semibold)
-                    }
-                    .foregroundStyle(theme.warning)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(theme.warning.opacity(0.1))
-                    .clipShape(Capsule())
-                }
-            }
-
-            // ── Suggested prompt cards ──
-            // Only shown when the server has configured suggestions.
-            // If the admin clears all suggestions (or the server doesn't
-            // return any), this entire block is hidden and the welcome
-            // screen shows only the hero avatar + "How can I help?".
-            if !randomPrompts.isEmpty {
-                Spacer().frame(height: 32)
-
-                // Adaptive grid: 2-col iPhone, 4-col iPad
-                let cols = promptColumnCount
-                let rows = stride(from: 0, to: randomPrompts.count, by: cols).map { i in
-                    Array(randomPrompts[i..<min(i + cols, randomPrompts.count)])
-                }
-                VStack(spacing: 10) {
-                    ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                        HStack(spacing: 10) {
-                            ForEach(row) { prompt in
-                                promptCard(prompt)
-                            }
-                            // Fill empty slots if row has fewer items than column count
-                            ForEach(0..<(cols - row.count), id: \.self) { _ in
-                                Color.clear
-                                    .frame(maxWidth: .infinity)
-                            }
+                    // Avatar — suppress all implicit animations so model-image
+                    // loading never plays a scale/fade pop on the welcome screen.
+                    Group {
+                        if let model = viewModel.selectedModel {
+                            ModelAvatar(
+                                size: 52,
+                                imageURL: viewModel.resolvedImageURL(for: model),
+                                label: model.shortName,
+                                authToken: viewModel.serverAuthToken
+                            )
+                        } else {
+                            ModelAvatar(size: 52, label: nil)
                         }
-                        .padding(.horizontal, Spacing.screenPadding)
+                    }
+                    .animation(nil, value: viewModel.selectedModel?.id)
+                    .transaction { $0.animation = nil }
+
+                    VStack(spacing: 4) {
+                        Text("How can I help?")
+                            .scaledFont(size: 24, weight: .bold)
+                            .foregroundStyle(theme.textPrimary)
+
+                        if let model = viewModel.selectedModel {
+                            Text(model.shortName)
+                                .scaledFont(size: 13, weight: .medium)
+                                .foregroundStyle(theme.textTertiary)
+                        }
+                    }
+
+                    if viewModel.isTemporaryChat {
+                        HStack(spacing: 5) {
+                            Image(systemName: "eye.slash.fill")
+                                .scaledFont(size: 10, weight: .semibold)
+                            Text("Temporary Chat")
+                                .scaledFont(size: 11, weight: .semibold)
+                        }
+                        .foregroundStyle(theme.warning)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(theme.warning.opacity(0.1))
+                        .clipShape(Capsule())
                     }
                 }
-                .frame(maxWidth: iPadMaxContentWidth)
-            }
+
+                // ── Suggested prompt cards ──
+                // Only shown when the server has configured suggestions.
+                // If the admin clears all suggestions (or the server doesn't
+                // return any), this entire block is hidden and the welcome
+                // screen shows only the hero avatar + "How can I help?".
+                if !randomPrompts.isEmpty {
+                    Spacer().frame(height: 32)
+
+                    // Adaptive grid: 2-col iPhone, 4-col iPad
+                    let cols = promptColumnCount
+                    let rows = stride(from: 0, to: randomPrompts.count, by: cols).map { i in
+                        Array(randomPrompts[i..<min(i + cols, randomPrompts.count)])
+                    }
+                    VStack(spacing: 10) {
+                        ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                            HStack(spacing: 10) {
+                                ForEach(row) { prompt in
+                                    promptCard(prompt)
+                                }
+                                // Fill empty slots if row has fewer items than column count
+                                ForEach(0..<(cols - row.count), id: \.self) { _ in
+                                    Color.clear
+                                        .frame(maxWidth: .infinity)
+                                }
+                            }
+                            .padding(.horizontal, Spacing.screenPadding)
+                        }
+                    }
+                    .frame(maxWidth: iPadMaxContentWidth)
+                    // Suppress insertion/removal animations on the prompt grid —
+                    // cards should appear instantly, not fly in from the side.
+                    .transaction { $0.animation = nil }
+                }
 
                 Spacer(minLength: 60).layoutPriority(1)
             }
@@ -2291,25 +2942,129 @@ struct ChatDetailView: View {
                     #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
             }
         }
+        .scrollContentBackground(.hidden)
         .background(ScrollViewHorizontalLock())
         .scrollDismissesKeyboard(.interactively)
+    }
+
+    // MARK: - Folder Background Image
+
+    /// Renders the folder background image full-screen with a dim overlay.
+    /// Handles both base64 data URIs and remote HTTP/HTTPS URLs.
+    /// Mirrors the web UI: image layer + dark overlay (black 45% opacity) so text stays readable.
+    ///
+    /// The `containerSize` parameter is provided by the `GeometryReader` in `body` so the image
+    /// fills the actual *view* bounds — not `UIScreen.main.bounds`. This prevents the background
+    /// from expanding beyond the view on iPad split-view, landscape, or Stage Manager, which was
+    /// causing the entire ZStack (and therefore the folder chat view) to stretch to the image's
+    /// native dimensions.
+    ///
+    /// Renders the folder workspace background image.
+    ///
+    /// Rendering strategy:
+    /// - Base64 images are decoded once into `_cachedFolderBgImage` via `.onAppear`.
+    /// - Remote URLs are routed through `ImageCacheService` which provides memory + disk
+    ///   caching, downsampling, and deduplication. The image is available instantly on
+    ///   repeat visits (no network round-trip), eliminating the flash/layout-shift.
+    /// - A stable `theme.background` placeholder fills the frame while loading so the
+    ///   layout never shifts; the image crossfades in once ready.
+    @ViewBuilder
+    private func folderBackgroundImage(url: String, containerSize: CGSize) -> some View {
+        let w = containerSize.width
+        let h = containerSize.height
+
+        ZStack {
+            // Stable background — always present, prevents any layout shift
+            theme.background
+                .frame(width: w, height: h)
+
+            if let cached = _cachedFolderBgImage {
+                Image(uiImage: cached)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: w, height: h)
+                    .clipped()
+                    .transition(.opacity)
+            }
+
+            // Dim overlay — matches web UI's dark:from-gray-900/90 gradient
+            Color.black.opacity(0.70)
+                .frame(width: w, height: h)
+        }
+        .frame(width: w, height: h)
+        .clipped()
+        // Load the background image once and cache it into @State.
+        // Base64: decoded synchronously (no network needed).
+        // Remote URL: routed through ImageCacheService for memory + disk caching.
+        //   - First visit: network fetch + downsampled to display size, saved to disk.
+        //   - Subsequent visits: instant memory/disk cache hit, no network round-trip.
+        .onAppear {
+            guard _cachedFolderBgImage == nil else { return }
+            if url.hasPrefix("data:") {
+                // Base64 inline — decode synchronously
+                guard let commaIdx = url.firstIndex(of: ",") else { return }
+                let b64 = String(url[url.index(after: commaIdx)...])
+                if let data = Data(base64Encoded: b64, options: .ignoreUnknownCharacters),
+                   let img = UIImage(data: data) {
+                    withAnimation(.easeIn(duration: 0.2)) {
+                        _cachedFolderBgImage = img
+                    }
+                }
+            } else if let api = dependencies.apiClient {
+                // Remote URL — use ImageCacheService for memory + disk caching.
+                let resolvedURL: URL?
+                if url.hasPrefix("http") {
+                    resolvedURL = URL(string: url)
+                } else {
+                    resolvedURL = URL(string: api.baseURL + url)
+                }
+                if let imgURL = resolvedURL {
+                    let authToken = api.network.authToken
+                    // Downsample to 2× the screen width for crisp display without memory waste.
+                    // A typical iPhone screen is 390pt wide; 3× = 1170px. Cap at 1280px.
+                    let targetPx = min(Int(w * UIScreen.main.scale), 1280)
+                    Task(priority: .userInitiated) {
+                        let img = await ImageCacheService.shared.loadImage(
+                            from: imgURL,
+                            authToken: authToken,
+                            targetPixelSize: targetPx
+                        )
+                        if let img {
+                            withAnimation(.easeIn(duration: 0.2)) {
+                                _cachedFolderBgImage = img
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Folder Welcome View
 
     private func folderWelcomeView(folder: ChatFolder) -> some View {
+        // Wrap in a ScrollView so the keyboard can be dismissed interactively
+        // (same pattern as welcomeView). Without this, tapping in the input field
+        // while the folder workspace is shown leaves the keyboard covering the bar
+        // because there's no scroll gesture to drive the interactive dismissal.
+        ScrollView {
         VStack(spacing: 0) {
-            Spacer(minLength: 60).layoutPriority(1)
+            Spacer(minLength: 40).layoutPriority(1)
 
             VStack(spacing: Spacing.md) {
-                // Folder icon
+                // Folder icon — show emoji if set, otherwise default folder SF Symbol
                 ZStack {
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
                         .fill(theme.brandPrimary.opacity(0.12))
                         .frame(width: 72, height: 72)
-                    Image(systemName: "folder.fill")
-                        .scaledFont(size: 34, weight: .medium)
-                        .foregroundStyle(theme.brandPrimary)
+                    if let icon = folder.meta?.icon, !icon.isEmpty {
+                        Text(icon)
+                            .font(.system(size: 36))
+                    } else {
+                        Image(systemName: "folder.fill")
+                            .scaledFont(size: 34, weight: .medium)
+                            .foregroundStyle(theme.brandPrimary)
+                    }
                 }
 
                 // Folder name
@@ -2363,7 +3118,16 @@ struct ChatDetailView: View {
             }
             .padding(.horizontal, Spacing.screenPadding)
 
-            Spacer(minLength: 60).layoutPriority(1)
+            // ── Recent chats list ─────────────────────────────────────────────────
+            // Shows recent chats in this folder so the user can quickly resume one
+            // without opening the sidebar drawer. Matches the web UI layout.
+            if !folder.chats.isEmpty {
+                Spacer(minLength: 24)
+
+                folderChatList(folder: folder)
+            }
+
+            Spacer(minLength: 40).layoutPriority(1)
         }
         .frame(maxWidth: iPadMaxContentWidth)
         .frame(maxWidth: .infinity)
@@ -2371,6 +3135,78 @@ struct ChatDetailView: View {
             UIApplication.shared.sendAction(
                 #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         }
+        } // end ScrollView
+        .scrollContentBackground(.hidden)
+        .scrollDismissesKeyboard(.interactively)
+    }
+
+    /// Scrollable list of recent chats in the folder workspace landing screen.
+    /// Matches the web UI's "Title / Updated at" table below the input field.
+    @ViewBuilder
+    private func folderChatList(folder: ChatFolder) -> some View {
+        // Section header
+        HStack {
+            Text("Recent Chats")
+                .scaledFont(size: 12, weight: .semibold)
+                .foregroundStyle(theme.textTertiary)
+                .textCase(.uppercase)
+                .tracking(0.5)
+            Spacer()
+        }
+        .padding(.horizontal, Spacing.screenPadding)
+        .padding(.bottom, 4)
+
+        // Chat rows — show up to 20; truncate silently for long folders
+        VStack(spacing: 0) {
+            let visibleChats = Array(folder.chats.prefix(20))
+            ForEach(Array(visibleChats.enumerated()), id: \.element.id) { idx, chat in
+                Button {
+                    // Notify parent to open this chat. We post a notification that
+                    // MainChatView/iPadMainChatView listen to via .onReceive so we
+                    // don't need a direct callback binding here.
+                    NotificationCenter.default.post(
+                        name: .folderWorkspaceChatSelected,
+                        object: chat.id
+                    )
+                    Haptics.play(.light)
+                } label: {
+                    HStack(spacing: Spacing.sm) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(chat.title.isEmpty ? "New Chat" : chat.title)
+                                .scaledFont(size: 14, weight: .medium)
+                                .foregroundStyle(theme.textPrimary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        Spacer(minLength: Spacing.sm)
+                        Text(chat.updatedAt.relativeShort)
+                            .scaledFont(size: 12)
+                            .foregroundStyle(theme.textTertiary)
+                            .lineLimit(1)
+                            .fixedSize()
+                    }
+                    .padding(.horizontal, Spacing.screenPadding)
+                    .padding(.vertical, 11)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                if idx < visibleChats.count - 1 {
+                    Divider()
+                        .padding(.leading, Spacing.screenPadding)
+                        .opacity(0.5)
+                }
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(theme.surfaceContainer.opacity(theme.isDark ? 0.3 : 0.5))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(theme.cardBorder.opacity(0.4), lineWidth: 0.5)
+        )
+        .padding(.horizontal, Spacing.screenPadding)
     }
 
     @ViewBuilder
@@ -2419,6 +3255,10 @@ struct ChatDetailView: View {
     // MARK: - Assistant Action Bar
 
     private func assistantActionBar(for message: ChatMessage) -> some View {
+        // Resolve chat permissions once for all guards in this bar.
+        // Admins always get full access (GroupChatPermissions() defaults all to true).
+        let chatPerms = dependencies.authViewModel.chatPermissions
+
         // Build a timestamp-sorted list of ALL sibling IDs (current main + versions).
         // This is the single source of truth for position — it never gets stale
         // because it is derived fresh from the message object on every render.
@@ -2437,33 +3277,49 @@ struct ChatDetailView: View {
         let displayIndex: Int = (allSiblings.firstIndex(where: { $0.id == message.id }) ?? 0) + 1
 
         return HStack(spacing: 6) {
-            // Speak
-            Button {
-                toggleSpeech(for: message)
-                Haptics.play(.light)
-            } label: {
-                if ttsGeneratingMessageId == message.id {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .scaleEffect(0.65)
-                        .frame(width: 28, height: 28)
-                        .tint(theme.brandPrimary)
-                } else {
-                    compactActionIcon(
-                        icon: speakingMessageId == message.id ? "stop.fill" : "speaker.wave.2",
-                        isActive: speakingMessageId == message.id
-                    )
+            // Speak — gated by permissions.chat.tts
+            if chatPerms.tts {
+                Button {
+                    toggleSpeech(for: message)
+                    Haptics.play(.light)
+                } label: {
+                    if ttsGeneratingMessageId == message.id {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .scaleEffect(0.65)
+                            .frame(width: 28, height: 28)
+                            .tint(theme.brandPrimary)
+                    } else {
+                        compactActionIcon(
+                            icon: speakingMessageId == message.id ? "stop.fill" : "speaker.wave.2",
+                            isActive: speakingMessageId == message.id
+                        )
+                    }
                 }
+                .buttonStyle(CompactActionButtonStyle())
+                .accessibilityLabel(speakingMessageId == message.id ? "Stop speaking" : "Speak")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(speakingMessageId == message.id ? "Stop speaking" : "Speak")
 
-            // Copy
+            // Copy (always available — no permission gate in WebUI either)
             Button { copyMessage(message) } label: {
                 compactActionIcon(icon: "doc.on.doc", isActive: false)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(CompactActionButtonStyle())
             .accessibilityLabel("Copy")
+
+            // Edit assistant message — gated by permissions.chat.edit
+            // Mirrors WebUI's editMessage(id, { content }, false): updates content
+            // in-place without creating a new branch or triggering regeneration.
+            if chatPerms.edit && !viewModel.isStreaming {
+                Button {
+                    beginAssistantEdit(message: message)
+                    Haptics.play(.light)
+                } label: {
+                    compactActionIcon(icon: "pencil", isActive: false)
+                }
+                .buttonStyle(CompactActionButtonStyle())
+                .accessibilityLabel("Edit response")
+            }
 
             // Version switcher (only when siblings exist and not overriding with a user edit version)
             if totalVersions > 1 && !viewModel.isStreaming && assistantContentOverride[message.id] == nil {
@@ -2477,13 +3333,18 @@ struct ChatDetailView: View {
                             // restoreAssistantVersionById() calls rederiveMessages() which
                             // replaces the message object entirely. After that, the target
                             // sibling IS the main message and all state is correct.
+                            // Clear stale activeVersionIndex/assistantContentOverride so the
+                            // new main message renders its own files and content — not whatever
+                            // the old activeVersionIndex was pointing to.
+                            activeVersionIndex.removeValue(forKey: message.id)
+                            assistantContentOverride.removeValue(forKey: message.id)
                             viewModel.restoreAssistantVersionById(targetSiblingId: targetId)
                             Haptics.play(.light)
                         }
                     } label: {
                         compactActionIcon(icon: "chevron.left", isActive: false, size: 10)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(CompactActionButtonStyle())
                     .disabled(displayIndex == 1)
                     .opacity(displayIndex == 1 ? 0.35 : 1)
 
@@ -2498,32 +3359,74 @@ struct ChatDetailView: View {
                         let targetPos = currentPos + 1
                         if targetPos < allSiblings.count {
                             let targetId = allSiblings[targetPos].id
+                            // Same cleanup as the ← button above.
+                            activeVersionIndex.removeValue(forKey: message.id)
+                            assistantContentOverride.removeValue(forKey: message.id)
                             viewModel.restoreAssistantVersionById(targetSiblingId: targetId)
                             Haptics.play(.light)
                         }
+
                     } label: {
                         compactActionIcon(icon: "chevron.right", isActive: false, size: 10)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(CompactActionButtonStyle())
                     .disabled(displayIndex == totalVersions)
                     .opacity(displayIndex == totalVersions ? 0.35 : 1)
                 }
             }
 
-            // Regenerate
-            if !viewModel.isStreaming {
+            // Regenerate — gated by permissions.chat.regenerate_response
+            if !viewModel.isStreaming && chatPerms.regenerateResponse {
                 Button {
                     Task { await viewModel.regenerateResponse(messageId: message.id) }
                     Haptics.play(.light)
                 } label: {
                     compactActionIcon(icon: "arrow.clockwise", isActive: false)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(CompactActionButtonStyle())
                 .accessibilityLabel("Regenerate")
             }
 
-            // Delete (only shown when there are multiple versions / regeneration history)
-            if !viewModel.isStreaming && totalVersions > 1 {
+            // Continue — gated by permissions.chat.continue_response.
+            // Only shown on the LAST assistant message so the user can append
+            // more content to an incomplete or truncated response.
+            let isLastAssistantMsg = viewModel.messages.last(where: { $0.role == .assistant })?.id == message.id
+            if !viewModel.isStreaming && chatPerms.continueResponse && isLastAssistantMsg {
+                Button {
+                    Task { await viewModel.continueLastResponse() }
+                    Haptics.play(.light)
+                } label: {
+                    compactActionIcon(icon: "play.fill", isActive: false)
+                }
+                .buttonStyle(CompactActionButtonStyle())
+                .accessibilityLabel("Continue response")
+            }
+
+            // Fork chat — clones the entire conversation and navigates to the fork.
+            // Matches open-webui's fork behaviour: POST /api/v1/chats/{id}/clone,
+            // then navigate to the newly created chat.
+            // Only shown when a saved conversation exists (not on brand-new chats).
+            if !viewModel.isStreaming && viewModel.conversation != nil {
+                Button {
+                    Task { await viewModel.forkChat(messageId: message.id) }
+                    Haptics.play(.light)
+                } label: {
+                    if viewModel.isForkingChat {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .scaleEffect(0.65)
+                            .frame(width: 28, height: 28)
+                            .tint(theme.brandPrimary)
+                    } else {
+                        compactActionIcon(icon: "arrow.branch", isActive: false)
+                    }
+                }
+                .buttonStyle(CompactActionButtonStyle())
+                .accessibilityLabel("Fork chat")
+            }
+
+            // Delete — gated by permissions.chat.delete_message (only when siblings exist)
+            if !viewModel.isStreaming && totalVersions > 1 && chatPerms.deleteMessage {
                 Button {
                     Task { await viewModel.deleteMessage(id: message.id) }
                     // After deletion, rederiveMessages() replaces the message list —
@@ -2533,7 +3436,7 @@ struct ChatDetailView: View {
                 } label: {
                     compactActionIcon(icon: "trash", isActive: false)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(CompactActionButtonStyle())
                 .accessibilityLabel("Delete Version")
             }
 
@@ -2552,8 +3455,50 @@ struct ChatDetailView: View {
                         isActive: usagePopoverMessageId == message.id
                     )
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(CompactActionButtonStyle())
                 .accessibilityLabel("Token usage")
+            }
+
+            // Thumbs up / down — gated by server enable_message_rating flag AND
+            // permissions.chat.rate_response. Also hidden during temporary chats
+            // (WebUI: !temporaryChatEnabled check).
+            if viewModel.messageRatingEnabled && !viewModel.isStreaming
+                && !viewModel.isTemporaryChat && chatPerms.rateResponse {
+                let currentRating = message.annotation?.rating
+                Button {
+                    Task {
+                        await viewModel.submitThumbsRating(message: message, rating: 1)
+                        // Open detail sheet with the updated message (feedbackId now set)
+                        if let updated = viewModel.messages.first(where: { $0.id == message.id }) {
+                            feedbackDetailMessage = updated
+                        }
+                    }
+                    Haptics.play(.light)
+                } label: {
+                    compactActionIcon(
+                        icon: currentRating == 1 ? "hand.thumbsup.fill" : "hand.thumbsup",
+                        isActive: currentRating == 1
+                    )
+                }
+                .buttonStyle(CompactActionButtonStyle())
+                .accessibilityLabel("Thumbs up")
+
+                Button {
+                    Task {
+                        await viewModel.submitThumbsRating(message: message, rating: -1)
+                        if let updated = viewModel.messages.first(where: { $0.id == message.id }) {
+                            feedbackDetailMessage = updated
+                        }
+                    }
+                    Haptics.play(.light)
+                } label: {
+                    compactActionIcon(
+                        icon: currentRating == -1 ? "hand.thumbsdown.fill" : "hand.thumbsdown",
+                        isActive: currentRating == -1
+                    )
+                }
+                .buttonStyle(CompactActionButtonStyle())
+                .accessibilityLabel("Thumbs down")
             }
 
             // Action buttons (from model's configured actions — e.g. Generate Image)
@@ -2567,7 +3512,7 @@ struct ChatDetailView: View {
                         } label: {
                             actionButtonIcon(action: action)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(CompactActionButtonStyle())
                         .accessibilityLabel(action.name)
                     }
                 }
@@ -2577,6 +3522,37 @@ struct ChatDetailView: View {
         }
     }
 
+    // MARK: - Assistant Inline Edit (in-place save, no regeneration)
+
+    /// Opens an inline edit sheet for an assistant message.
+    /// Unlike user message editing (which creates a new branch + regenerates),
+    /// this mirrors WebUI's `editMessage(id, { content }, false)` — it saves
+    /// the edited content in-place to the history tree and syncs to the server
+    /// without triggering a new AI response.
+    private func beginAssistantEdit(message: ChatMessage) {
+        editingAssistantMessageId = message.id
+        editingAssistantText = message.content
+        Haptics.play(.light)
+    }
+
+    private func cancelAssistantEdit() {
+        isAssistantEditFocused = false
+        editingAssistantMessageId = nil
+        editingAssistantText = ""
+    }
+
+    private func submitAssistantEdit() {
+        guard let id = editingAssistantMessageId else { return }
+        let trimmed = editingAssistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        isAssistantEditFocused = false
+        editingAssistantMessageId = nil
+        let savedText = editingAssistantText
+        editingAssistantText = ""
+        Task { await viewModel.saveAssistantMessageContent(id: id, newContent: savedText) }
+        Haptics.play(.medium)
+    }
+
     /// Compact action icon for the always-visible action bar.
     private func compactActionIcon(icon: String, isActive: Bool, size: CGFloat = 12) -> some View {
         Image(systemName: icon)
@@ -2584,6 +3560,17 @@ struct ChatDetailView: View {
             .foregroundStyle(isActive ? theme.brandPrimary : theme.textTertiary.opacity(0.7))
             .frame(width: 28, height: 28)
             .contentShape(Circle())
+    }
+
+    /// ButtonStyle for the compact action icons in assistantActionBar.
+    /// Scales to 0.88 and dims on press — snappy spring so it feels instantly responsive.
+    private struct CompactActionButtonStyle: ButtonStyle {
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .scaleEffect(configuration.isPressed ? 0.88 : 1.0)
+                .opacity(configuration.isPressed ? 0.65 : 1.0)
+                .animation(.spring(response: 0.2, dampingFraction: 0.85), value: configuration.isPressed)
+        }
     }
 
     // MARK: - User Version Switcher (always-visible when edit history exists)
@@ -2696,24 +3683,12 @@ struct ChatDetailView: View {
 
     @ViewBuilder
     private func userAttachmentImages(for message: ChatMessage) -> some View {
-        let imageFiles = message.files.filter { $0.type == "image" }
-        let nonImageFiles = message.files.filter { $0.type != "image" }
+        let imageFiles = message.files.filter { isImageFile($0) }
+        let nonImageFiles = message.files.filter { !isImageFile($0) }
 
         VStack(alignment: .trailing, spacing: Spacing.xs) {
             if !imageFiles.isEmpty {
-                HStack(spacing: Spacing.sm) {
-                    Spacer()
-                    ForEach(Array(imageFiles.prefix(4).enumerated()), id: \.offset) { _, file in
-                        if let fileId = file.url, !fileId.isEmpty {
-                            AuthenticatedImageView(fileId: fileId, apiClient: dependencies.apiClient)
-                                .frame(
-                                    maxWidth: imageFiles.count == 1 ? 200 : 100,
-                                    maxHeight: imageFiles.count == 1 ? 200 : 100
-                                )
-                                .clipShape(RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous))
-                        }
-                    }
-                }
+                userImageMosaicGrid(imageFiles: imageFiles)
             }
             if !nonImageFiles.isEmpty {
                 HStack(spacing: Spacing.sm) {
@@ -2724,6 +3699,159 @@ struct ChatDetailView: View {
                 }
             }
         }
+    }
+
+    /// Smart mosaic grid for user-sent images:
+    /// - 1 image: full-width up to 260pt
+    /// - 2 images: side-by-side
+    /// - 3 images: one large left + two stacked right
+    /// - 4+ images: 2×2 grid with +N overflow badge on last tile
+    @ViewBuilder
+    private func userImageMosaicGrid(imageFiles: [ChatMessageFile]) -> some View {
+        let shown = imageFiles.prefix(4)
+        let overflow = imageFiles.count - 4
+
+        HStack(spacing: 0) {
+            Spacer(minLength: 64)
+
+            let tileCorner: CGFloat = 14
+            let gap: CGFloat = 3
+
+            Group {
+                switch imageFiles.count {
+                case 1:
+                    // Single: full-width up to 260, natural aspect ratio
+                    if let fileId = shown[0].url, !fileId.isEmpty {
+                        AuthenticatedImageView(fileId: fileId, apiClient: dependencies.apiClient)
+                            .frame(maxWidth: 260, maxHeight: 300)
+                            .clipShape(RoundedRectangle(cornerRadius: tileCorner, style: .continuous))
+                    }
+
+                case 2:
+                    // Two side-by-side
+                    HStack(spacing: gap) {
+                        ForEach(Array(shown.enumerated()), id: \.offset) { idx, file in
+                            if let fileId = file.url, !fileId.isEmpty {
+                                AuthenticatedImageView(fileId: fileId, apiClient: dependencies.apiClient)
+                                    .scaledToFill()
+                                    .frame(width: 126, height: 126)
+                                    .clipped()
+                                    .clipShape(
+                                        .rect(
+                                            topLeadingRadius: idx == 0 ? tileCorner : 0,
+                                            bottomLeadingRadius: idx == 0 ? tileCorner : 0,
+                                            bottomTrailingRadius: idx == 1 ? tileCorner : 0,
+                                            topTrailingRadius: idx == 1 ? tileCorner : 0
+                                        )
+                                    )
+                            }
+                        }
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: tileCorner, style: .continuous))
+
+                case 3:
+                    // Large left + two stacked right
+                    HStack(spacing: gap) {
+                        if let fileId = shown[0].url, !fileId.isEmpty {
+                            AuthenticatedImageView(fileId: fileId, apiClient: dependencies.apiClient)
+                                .scaledToFill()
+                                .frame(width: 168, height: 168)
+                                .clipped()
+                                .clipShape(
+                                    .rect(
+                                        topLeadingRadius: tileCorner,
+                                        bottomLeadingRadius: tileCorner,
+                                        bottomTrailingRadius: 0,
+                                        topTrailingRadius: 0
+                                    )
+                                )
+                        }
+                        VStack(spacing: gap) {
+                            ForEach([1, 2], id: \.self) { idx in
+                                if let fileId = shown[idx].url, !fileId.isEmpty {
+                                    AuthenticatedImageView(fileId: fileId, apiClient: dependencies.apiClient)
+                                        .scaledToFill()
+                                        .frame(width: 82, height: 82)
+                                        .clipped()
+                                        .clipShape(
+                                            .rect(
+                                                topLeadingRadius: 0,
+                                                bottomLeadingRadius: 0,
+                                                bottomTrailingRadius: idx == 2 ? tileCorner : 0,
+                                                topTrailingRadius: idx == 1 ? tileCorner : 0
+                                            )
+                                        )
+                                }
+                            }
+                        }
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: tileCorner, style: .continuous))
+
+                default:
+                    // 4+ images: 2×2 grid with overflow badge
+                    VStack(spacing: gap) {
+                        HStack(spacing: gap) {
+                            ForEach([0, 1], id: \.self) { idx in
+                                if let fileId = shown[idx].url, !fileId.isEmpty {
+                                    AuthenticatedImageView(fileId: fileId, apiClient: dependencies.apiClient)
+                                        .scaledToFill()
+                                        .frame(width: 126, height: 126)
+                                        .clipped()
+                                        .clipShape(
+                                            .rect(
+                                                topLeadingRadius: idx == 0 ? tileCorner : 0,
+                                                bottomLeadingRadius: 0,
+                                                bottomTrailingRadius: 0,
+                                                topTrailingRadius: idx == 1 ? tileCorner : 0
+                                            )
+                                        )
+                                }
+                            }
+                        }
+                        HStack(spacing: gap) {
+                            ForEach([2, 3], id: \.self) { idx in
+                                if let fileId = shown[idx].url, !fileId.isEmpty {
+                                    ZStack {
+                                        AuthenticatedImageView(fileId: fileId, apiClient: dependencies.apiClient)
+                                            .scaledToFill()
+                                            .frame(width: 126, height: 126)
+                                            .clipped()
+                                            .clipShape(
+                                                .rect(
+                                                    topLeadingRadius: 0,
+                                                    bottomLeadingRadius: idx == 2 ? tileCorner : 0,
+                                                    bottomTrailingRadius: idx == 3 ? tileCorner : 0,
+                                                    topTrailingRadius: 0
+                                                )
+                                            )
+
+                                        // Overflow badge on tile 4 (idx == 3)
+                                        if idx == 3 && overflow > 0 {
+                                            Color.black.opacity(0.55)
+                                                .frame(width: 126, height: 126)
+                                                .clipShape(
+                                                    .rect(
+                                                        topLeadingRadius: 0,
+                                                        bottomLeadingRadius: 0,
+                                                        bottomTrailingRadius: tileCorner,
+                                                        topTrailingRadius: 0
+                                                    )
+                                                )
+                                            Text("+\(overflow)")
+                                                .scaledFont(size: 22, weight: .bold)
+                                                .foregroundStyle(.white)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: tileCorner, style: .continuous))
+                }
+            }
+        }
+        .padding(.horizontal, Spacing.screenPadding)
+        .padding(.vertical, 2)
     }
 
     private func fileAttachmentCard(file: ChatMessageFile) -> some View {
@@ -2766,6 +3894,21 @@ struct ChatDetailView: View {
             )
         }
         .buttonStyle(.plain)
+    }
+
+    /// Returns true if a ChatMessageFile represents an image, regardless of whether
+    /// the server stored it with type "image" or type "file" + an image contentType.
+    private func isImageFile(_ file: ChatMessageFile) -> Bool {
+        if file.type == "image" { return true }
+        if let ct = file.contentType, ct.hasPrefix("image/") { return true }
+        // Fallback: check file extension from name
+        if let name = file.name ?? file.url {
+            let ext = (name as NSString).pathExtension.lowercased()
+            if ["jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif"].contains(ext) {
+                return true
+            }
+        }
+        return false
     }
 
     private func fileIconName(for ext: String) -> String {
@@ -3046,6 +4189,7 @@ struct ChatDetailView: View {
         showCameraPicker = false
         showFilePicker = false
         showPhotosPicker = false
+        showAnimatedPhotoPicker = false
         showAudioPicker = false
         showWebURLAlert = false
     }
@@ -3062,6 +4206,12 @@ struct ChatDetailView: View {
         if !viewModel.isConfigured, let manager = dependencies.conversationManager {
             viewModel.configure(with: manager, socket: dependencies.socketService, store: dependencies.activeChatStore, asr: dependencies.asrService, notes: dependencies.notesManager)
         }
+        // Populate server feature flags in ActiveChatStore so isMemoryAvailable
+        // returns true for all models when the server has memories enabled —
+        // not just for models with builtinTools.memory.
+        if dependencies.activeChatStore.serverFeatures == nil {
+            dependencies.activeChatStore.serverFeatures = dependencies.authViewModel.featurePermissions
+        }
         // Perform non-async setup before awaiting load() so the UI
         // populates prompts and temporary-chat state instantly.
         if viewModel.isNewConversation {
@@ -3070,11 +4220,12 @@ struct ChatDetailView: View {
         // Only resolve prompts pre-load for new chats — existing chats
         // already have a model; we'll resolve after load() below (D10 fix).
         if viewModel.isNewConversation {
-            randomPrompts = Self.resolvePromptSuggestions(
+            let preLoadPrompts = Self.resolvePromptSuggestions(
                 adminSuggestions: dependencies.authViewModel.backendConfig?.defaultPromptSuggestions,
                 modelSuggestions: viewModel.selectedModel?.suggestionPrompts,
                 count: promptCardCount
             )
+            withTransaction(\.animation, nil) { randomPrompts = preLoadPrompts }
         }
         NotificationService.shared.activeConversationId =
             viewModel.conversationId ?? viewModel.conversation?.id
@@ -3084,35 +4235,126 @@ struct ChatDetailView: View {
         if loadedCount > 0 {
             isScrolledUp = false
             windowEnd = nil
-            windowSize = min(maxWindowSize, loadedCount)
-            // Suppress the content-height-driven streaming scroll while
-            // WKWebViews, MarkdownView, and other expensive blocks finish
-            // their first layout pass. The pump interval is 400 ms; adding
-            // a 500 ms offset gives ~900 ms total dead-zone — enough for
-            // WKWebViews on older devices to report their rendered heights
-            // via JS postMessage without triggering scroll position jumps
-            // (A3 fix, extended for lazy WKWebView init).
+            // Start with a small window (last ~8 rows). The minHeight trick on the
+            // last user→assistant turn (windowIncludesEnd) already stretches that
+            // last turn to fill the full viewport, so 8 rows is more than enough to
+            // land exactly on the true last message with no visible scroll.
+            // Keeping the window small avoids synchronously instantiating all heavy
+            // rows (WKWebView, MarkdownView, Litext) during cold-start.
+            // Window growth happens on-demand via the scroll-up pagination handler
+            // in scrollContent (onScrollGeometryChange / newOffset.y < 600), which
+            // prepends rows while the user is actively scrolling up — that path
+            // preserves scroll position correctly and never strands the user.
+            windowSize = min(8, loadedCount)
+            // Keep pump suppression armed — the settle loop below will extend it.
             _pumpRef.lastScrollTime = Date().addingTimeInterval(0.5)
-            // Scroll to bottom after load so that re-opened chats always start at
-            // the latest message. The .onAppear scrollTo (in messageListArea) fires
-            // before content height is known when the VM already has cached messages,
-            // making it a no-op. onChange(of: messages.count) never fires because the
-            // cached VM's count didn't change. A short settle delay matches the same
-            // approach used in the first-open (old == 0) branch of onChange(of: messages.count).
+            // Fix B — Settle loop: repeatedly snap to .bottom and watch the content
+            // height until it stops changing (WKWebViews / MarkdownView heights have
+            // all been reported) before lifting the curtain. A fixed delay is
+            // inherently unreliable because async height callbacks can arrive at any
+            // time; polling for stability is the only race-free approach.
+            // The whole loop runs behind the opacity+blur curtain so the user never
+            // sees any scroll movement — they are revealed already at the true bottom.
             Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 150_000_000) // 150ms layout settle
-                _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.4)
+                // Keep pump suppression armed for the full settle period.
+                let settleDeadline = Date().addingTimeInterval(1.5) // hard cap 1.5 s
+                _pumpRef.programmaticScrollUntil = settleDeadline
+                _pumpRef.lastScrollTime = settleDeadline
+
+                var lastHeight: CGFloat = 0
+                var stableTickCount = 0
+                let requiredStableTicks = 2  // 2 consecutive unchanged heights = settled
+                let tickInterval: UInt64 = 80_000_000 // 80 ms per tick
+
+                // ── Part B: Pre-warm parse cache for the initial window ──────
+                // While behind the blur curtain, kick off background parsing for
+                // every assistant message in the initial window. By the time the
+                // curtain lifts, AssistantMessageContent gets a global cache hit
+                // on the very first render — zero main-thread parse work at open.
+                // This runs off-main inside the actor, piggybacking on idle time
+                // while we're already waiting for layout to settle.
+                let messages = viewModel.messages
+                let windowStart = max(0, messages.count - windowSize)
+                let windowMessages = Array(messages[windowStart...])
+                let serverBase = viewModel.serverBaseURL
+                Task(priority: .background) {
+                    // Delay warmBatch by 300 ms so the initial Litext/MarkdownView
+                    // layout burst (mounting the first window of rows) can complete
+                    // before we consume any cooperative thread-pool slots. Without
+                    // this delay, warmBatch competes with the main thread's first
+                    // layout pass and makes early scrolling feel sluggish.
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    let contentsToParse: [String] = windowMessages.compactMap { msg -> String? in
+                        guard msg.role == .assistant else { return nil }
+                        // Replicate the same content resolution IsolatedAssistantMessage uses
+                        // (non-streaming path: resolveRelativeURLs + preprocessCitations).
+                        // Sources are empty at pre-warm time — that's fine, the cache key
+                        // includes the full resolved string, and citations are stable once
+                        // the message is loaded.
+                        let raw = msg.content
+                        guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+                        let resolved = IsolatedAssistantMessage.resolveRelativeURLs(raw, baseURL: serverBase)
+                        // Skip citation preprocessing here — sources may be empty and the
+                        // resolved-only string is a different cache key than the cited version.
+                        // The first real render will do a fast async miss→store for the cited
+                        // variant, which is still off-main. The pre-warm covers the common
+                        // case (messages without citations / no sources).
+                        return resolved
+                    }
+                    await MessageParseCache.shared.warmBatch(contentsToParse)
+                }
+
+                // Initial snap — fires before the first layout pass so
+                // .defaultScrollAnchor(.bottom) always has a partner snap.
                 scrollPosition.scrollTo(edge: .bottom)
+
+                while Date() < settleDeadline {
+                    try? await Task.sleep(nanoseconds: tickInterval)
+                    scrollPosition.scrollTo(edge: .bottom)
+                    let currentHeight = viewState_contentHeight
+                    if abs(currentHeight - lastHeight) < 1 && currentHeight > 0 {
+                        stableTickCount += 1
+                        if stableTickCount >= requiredStableTicks { break }
+                    } else {
+                        stableTickCount = 0
+                        lastHeight = currentHeight
+                    }
+                }
+
+                // One final authoritative snap after heights have stabilised.
+                scrollPosition.scrollTo(edge: .bottom)
+                // Lift the curtain — user sees the chat already at the true bottom.
+                // Window remains at 8 rows — the scroll-up pagination handler in
+                // scrollContent grows it on-demand as the user scrolls up, which
+                // preserves scroll position correctly (prepends above viewport).
+                isContentReady = true
             }
+        } else {
+            // New chat (no messages) — welcome screen, nothing to scroll.
+            // Reveal immediately so the input field and hero appear instantly.
+            isContentReady = true
         }
         await viewModel.fetchPinnedModels()
-        // Rebuild prompts after load() — models are now fetched with fresh
-        // suggestion_prompts from the server.
-        randomPrompts = Self.resolvePromptSuggestions(
-            adminSuggestions: dependencies.authViewModel.backendConfig?.defaultPromptSuggestions,
-            modelSuggestions: viewModel.selectedModel?.suggestionPrompts,
-            count: promptCardCount
-        )
+        await viewModel.fetchMessageRatingEnabled()
+        // After fetchPinnedModels(), only rebuild prompts when they are still
+        // empty (e.g. backendConfig wasn't ready on the first call) OR when the
+        // selected model has per-model suggestion_prompts that differ from what
+        // the pre-load resolve returned. This prevents the double-shuffle flicker
+        // where the first resolve picks 4 random cards and this second resolve
+        // immediately picks 4 *different* random cards, causing a left-to-right
+        // slide animation as all card text changes at once.
+        let newModelSuggestions = viewModel.selectedModel?.suggestionPrompts
+        let hasModelSuggestions = !(newModelSuggestions?.isEmpty ?? true)
+        // Only re-resolve if: prompts are empty (first-launch timing) OR the
+        // model now has per-model suggestions (which override admin suggestions).
+        if randomPrompts.isEmpty || hasModelSuggestions {
+            let postLoadPrompts = Self.resolvePromptSuggestions(
+                adminSuggestions: dependencies.authViewModel.backendConfig?.defaultPromptSuggestions,
+                modelSuggestions: newModelSuggestions,
+                count: promptCardCount
+            )
+            withTransaction(\.animation, nil) { randomPrompts = postLoadPrompts }
+        }
     }
 
     private func handleDisappear() {
@@ -3165,7 +4407,17 @@ struct ChatDetailView: View {
                 modelName: viewModel.selectedModel?.name ?? "AI Assistant"
             )
         }
-        router.presentVoiceCall(viewModel: voiceCallVM)
+        // Gate on on-device model download before opening the call.
+        // If the user's chosen TTS engine needs an on-device model that isn't
+        // downloaded yet, show the download sheet first. Once the model is ready
+        // the sheet calls onReady → we present the voice call then.
+        let tts = dependencies.textToSpeechService
+        if tts.needsOnDeviceModelDownload {
+            pendingVoiceCallVM = voiceCallVM
+            showVoiceModelDownload = true
+        } else {
+            router.presentVoiceCall(viewModel: voiceCallVM)
+        }
     }
 
     private func toggleSpeech(for message: ChatMessage) {
@@ -3664,6 +4916,42 @@ for item in items {
         }
     }
 
+    /// Process PHAssets selected from the AnimatedPhotoPicker.
+    /// Loads full-res data via PHImageManager and creates ChatAttachment objects
+    /// with thumbnails, then immediately starts uploading each one.
+    private func processSelectedPHAssets(_ assets: [PHAsset]) async {
+        for asset in assets {
+            await withCheckedContinuation { cont in
+                let opts = PHImageRequestOptions()
+                opts.deliveryMode = .highQualityFormat
+                opts.isNetworkAccessAllowed = true
+                opts.isSynchronous = false
+
+                PHImageManager.default().requestImageDataAndOrientation(
+                    for: asset, options: opts
+                ) { data, _, _, _ in
+                    guard let data else { cont.resume(); return }
+                    let image = UIImage(data: data)
+                    let thumbnail = image.map { Image(uiImage: $0) }
+                    let resized = FileAttachmentService.downsampleForUpload(data: data, image: image)
+                    let attachment = ChatAttachment(
+                        type: .image,
+                        name: "Photo_\(Int(Date.now.timeIntervalSince1970)).jpg",
+                        thumbnail: thumbnail,
+                        data: resized
+                    )
+                    DispatchQueue.main.async {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.78)) {
+                            viewModel.attachments.append(attachment)
+                        }
+                        viewModel.uploadAttachmentImmediately(attachmentId: attachment.id)
+                    }
+                    cont.resume()
+                }
+            }
+        }
+    }
+
     private func processFileURL(_ url: URL) async {
         let hasAccess = url.startAccessingSecurityScopedResource()
         defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
@@ -3817,6 +5105,46 @@ for item in items {
             // Present share sheet
             downloadedFileURL = tempFile
 
+        } catch {
+            withAnimation { isDownloadingFile = false }
+            downloadErrorMessage = "Failed to download: \(error.localizedDescription)"
+            showDownloadError = true
+        }
+    }
+
+    /// Downloads any server-hosted file via an authenticated raw GET request,
+    /// saves it to a temp directory, and presents the iOS share sheet.
+    /// Used for non-/api/v1/files/ server URLs (e.g. /cache/files/…, /uploads/…).
+    private func downloadAndShareArbitraryURL(_ url: URL) async {
+        guard let apiClient = dependencies.apiClient else {
+            downloadErrorMessage = "Not connected to server."
+            showDownloadError = true
+            return
+        }
+        withAnimation { isDownloadingFile = true }
+        do {
+            let (data, response) = try await apiClient.network.requestRawAbsoluteURL(url)
+            var fileName = url.lastPathComponent.isEmpty ? "download" : url.lastPathComponent
+            let contentType = response.value(forHTTPHeaderField: "Content-Type") ?? ""
+            if (fileName as NSString).pathExtension.isEmpty {
+                let ext: String
+                switch contentType {
+                case let ct where ct.contains("pdf"): ext = "pdf"
+                case let ct where ct.contains("pptx") || ct.contains("presentation"): ext = "pptx"
+                case let ct where ct.contains("docx") || ct.contains("word"): ext = "docx"
+                case let ct where ct.contains("xlsx") || ct.contains("spreadsheet"): ext = "xlsx"
+                case let ct where ct.contains("plain"): ext = "txt"
+                case let ct where ct.contains("json"): ext = "json"
+                case let ct where ct.contains("png"): ext = "png"
+                case let ct where ct.contains("jpeg") || ct.contains("jpg"): ext = "jpg"
+                default: ext = "bin"
+                }
+                fileName = "\(fileName).\(ext)"
+            }
+            let tempFile = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+            try data.write(to: tempFile)
+            withAnimation { isDownloadingFile = false }
+            downloadedFileURL = tempFile
         } catch {
             withAnimation { isDownloadingFile = false }
             downloadErrorMessage = "Failed to download: \(error.localizedDescription)"
@@ -4001,12 +5329,12 @@ private struct IsolatedAssistantMessage: View {
         if effectiveIsStreaming && rawContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // Wrap in HStack+Spacer to pin the indicator to the leading edge.
             // Without this, the infinity-width assistant content frame can
-            // misplace or stretch the 44×22pt fixed view.
+            // misplace or stretch the fixed view.
             // minHeight: 44 ensures the new message row has enough natural height
             // from the first frame so the minHeight-VStack scroll anchor doesn't
-            // position the TypingIndicator above/overlapping the row header.
+            // position the indicator above/overlapping the row header.
             HStack(spacing: 0) {
-                TypingIndicator()
+                BlinkingCursorIndicator()
                 Spacer()
             }
             .frame(minHeight: 44)
@@ -4063,15 +5391,17 @@ private struct IsolatedAssistantMessage: View {
                         // An unclosed <details> block must disable streaming so
                         // the raw HTML tag text doesn't flash before the block
                         // completes.
-                        let liveTailHasUnclosedDetails = liveTailStr.contains("<details") && !liveTailStr.contains("</details>")
                         // A VIZ block must still stream so InlineVisualizerView
                         // receives isStreaming: true and uses its reconcileContent
                         // path instead of finalizeContent (which fails on partial HTML).
+                        // NOTE: We no longer disable streaming for unclosed <details> blocks.
+                        // The pipeline freeze was removed — ToolCallParser.findDetailsBlocks()
+                        // skips incomplete blocks, so partial <details> in the live tail
+                        // are invisible to the user and always safe to stream through.
                         let liveTailHasViz = liveTailStr.contains("@@@VIZ-START")
-                        let liveTailHasSpecial = liveTailHasUnclosedDetails || liveTailHasViz
 
-                        if !liveTailStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            if !liveTailHasSpecial && !streamingStore.liveTailFrozenProse.isEmpty {
+                        if !liveTailStr.isEmpty {
+                            if !liveTailHasViz && !streamingStore.liveTailFrozenProse.isEmpty {
                                 // Further split at prose boundary within the live tail.
                                 // The live segment starts on a new paragraph boundary,
                                 // so we add 16pt to match the CommonMark paragraphSpacing
@@ -4082,8 +5412,8 @@ private struct IsolatedAssistantMessage: View {
                                         .padding(.top, 16)
                                 }
                             } else {
-                                // VIZ content must stream; only unclosed <details> disables it.
-                                StreamingMarkdownView(content: liveTailStr, isStreaming: !liveTailHasUnclosedDetails)
+                                // Stream live tail — VIZ content and plain text both stream.
+                                StreamingMarkdownView(content: liveTailStr, isStreaming: true)
                             }
                         }
                     } else if useSplitProse {
@@ -4230,7 +5560,9 @@ private struct IsolatedAssistantMessage: View {
     static func resolveRelativeURLs(_ content: String, baseURL: String) -> String {
         let base = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard !base.isEmpty else { return content }
-        let pattern = #"(\]\()(/api/[^\s\)]+)"#
+        // Match any markdown link target that starts with a single "/" (server-relative path)
+        // but NOT "//" (protocol-relative) and NOT already-absolute URLs (containing "://").
+        let pattern = #"(\]\()(\/(?!\/)[^\s\)]*)"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return content }
         let nsContent = content as NSString
         let matches = regex.matches(in: content, range: NSRange(location: 0, length: nsContent.length))
@@ -4246,6 +5578,12 @@ private struct IsolatedAssistantMessage: View {
             let prefix = nsContent.substring(with: prefixRange)
             let pathRange = match.range(at: 2)
             let relativePath = nsContent.substring(with: pathRange)
+            // Skip if the path already contains "://" (already absolute, shouldn't happen but be safe)
+            guard !relativePath.contains("://") else {
+                result += "\(prefix)\(relativePath)"
+                currentIndex = fullRange.location + fullRange.length
+                continue
+            }
             result += "\(prefix)\(base)\(relativePath)"
             currentIndex = fullRange.location + fullRange.length
         }
@@ -4313,14 +5651,32 @@ struct UserMessageContentView: View {
             let segs = segments
             let hasChips = segs.contains { if case .skill = $0 { return true }; return false }
             if !hasChips {
-                Text(content)
-                    .scaledFont(size: 15, context: .content)
+                // Render inline markdown (bold, italic, code, strikethrough) using
+                // Swift's built-in AttributedString. inlineOnlyPreservingWhitespace
+                // handles all standard inline syntax while preserving newlines and
+                // whitespace, which is important inside a compact user bubble.
+                // Falls back to plain text if parsing fails.
+                if let attributed = try? AttributedString(
+                    markdown: content,
+                    options: AttributedString.MarkdownParsingOptions(
+                        interpretedSyntax: .inlineOnlyPreservingWhitespace
+                    )
+                ) {
+                    Text(attributed)
+                        .scaledFont(size: 15, context: .content)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text(content)
+                        .scaledFont(size: 15, context: .content)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else {
                 SkillTaggedTextView(segments: segs)
             }
         } else {
             Text(content)
                 .scaledFont(size: 15, context: .content)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -4427,7 +5783,7 @@ struct PromptCardButtonStyle: ButtonStyle {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.97 : 1.0)
             .opacity(configuration.isPressed ? 0.85 : 1.0)
-            .animation(.spring(response: 0.25, dampingFraction: 0.7), value: configuration.isPressed)
+            .animation(.spring(response: 0.25, dampingFraction: 0.85), value: configuration.isPressed)
     }
 }
 
@@ -4739,10 +6095,13 @@ private extension View {
     func applyWidgetAndPickerHandlers(
         showCameraPicker: Binding<Bool>,
         showPhotosPicker: Binding<Bool>,
+        showAnimatedPhotoPicker: Binding<Bool>,
         showFilePicker: Binding<Bool>,
         selectedPhotos: Binding<[PhotosPickerItem]>,
         codePreviewCode: Binding<String?>,
         codePreviewLanguage: Binding<String>,
+        photoPickerRequestAction: (() -> Void)? = nil,
+        onProcessPhotos: @escaping ([PHAsset]) async -> Void = { _ in },
         onDismissOverlays: @escaping () -> Void
     ) -> some View {
         self
@@ -4759,10 +6118,18 @@ private extension View {
                 showCameraPicker.wrappedValue = true
             }
             .onReceive(NotificationCenter.default.publisher(for: .openUIPhotosChat)) { _ in
-                showPhotosPicker.wrappedValue = true
+                if let request = photoPickerRequestAction {
+                    request()
+                } else {
+                    showAnimatedPhotoPicker.wrappedValue = true
+                }
             }
             .onReceive(NotificationCenter.default.publisher(for: .openUIFileChat)) { _ in
                 showFilePicker.wrappedValue = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openUIPhotoPickerConfirm)) { notification in
+                guard let assets = notification.userInfo?["assets"] as? [PHAsset] else { return }
+                Task { await onProcessPhotos(assets) }
             }
             .photosPicker(
                 isPresented: showPhotosPicker,
@@ -4779,21 +6146,24 @@ private extension View {
 
 // MARK: - Share Extension Handlers (Type-Checker Relief)
 
-/// Handles both the plain-text pre-fill and the web-scraping URL pipeline
-/// from the Share Extension. Extracted from body so the Swift type-checker
-/// doesn't have to resolve these two `.onChange` closures inline.
+/// Handles plain-text pre-fill, web-scraping URL pipeline, model override,
+/// and auto-send from the Share Extension and URL scheme deep-links.
+/// Extracted from body so the Swift type-checker doesn't have to resolve
+/// these `.onChange` closures inline.
 private extension View {
     func applyShareExtensionHandlers(
         dependencies: AppDependencyContainer,
         viewModel: ChatViewModel
     ) -> some View {
         self
+            // --- Plain-text pre-fill (Share Extension + openui://new-chat?prompt=) ---
             .onChange(of: dependencies.pendingIncomingTextVersion) { _, _ in
                 if let text = dependencies.pendingIncomingText, !text.isEmpty {
                     viewModel.inputText = text
                     dependencies.pendingIncomingText = nil
                 }
             }
+            // --- Web-scraping URL pipeline (Share Extension) ---
             .onChange(of: dependencies.pendingIncomingWebURLsVersion) { _, _ in
                 let urls = dependencies.pendingIncomingWebURLs
                 if !urls.isEmpty {
@@ -4801,6 +6171,45 @@ private extension View {
                     for urlString in urls {
                         viewModel.processWebURL(urlString: urlString)
                     }
+                }
+            }
+            // --- Model override (openui://new-chat?model=) ---
+            // Only applied on new chats (initialConversationId == nil) so the URL
+            // scheme can't silently hijack an existing conversation's model.
+            .onChange(of: dependencies.pendingIncomingModelVersion) { _, _ in
+                if let modelId = dependencies.pendingIncomingModelId, !modelId.isEmpty {
+                    dependencies.pendingIncomingModelId = nil
+                    // Validate against the available models list; fall back silently
+                    // if the requested model doesn't exist on this server.
+                    if viewModel.availableModels.contains(where: { $0.id == modelId }) {
+                        viewModel.selectedModelId = modelId
+                    }
+                    // If models haven't loaded yet, wait for them and retry once.
+                    else if viewModel.availableModels.isEmpty {
+                        Task { @MainActor in
+                            // Give the model list up to 3 s to populate, then apply.
+                            for _ in 0..<30 {
+                                try? await Task.sleep(for: .milliseconds(100))
+                                if viewModel.availableModels.contains(where: { $0.id == modelId }) {
+                                    viewModel.selectedModelId = modelId
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // --- Auto-send (openui://new-chat?send=true) ---
+            // Fires after `pendingIncomingTextVersion` has already pre-filled the input.
+            // A short delay ensures the input text is committed before sendMessage() reads it.
+            .onChange(of: dependencies.pendingAutoSendVersion) { _, _ in
+                guard dependencies.pendingAutoSend else { return }
+                dependencies.pendingAutoSend = false
+                // Only send if there is actually something to send.
+                guard !viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                // Brief delay so the text field renders the pre-fill before sending.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    Task { await viewModel.sendMessage() }
                 }
             }
     }
@@ -4814,7 +6223,8 @@ private extension View {
 private extension View {
     func applyLinkAndPromptHandlers(
         viewModel: ChatViewModel,
-        downloadAndShare: @escaping (String) -> Void
+        downloadAndShare: @escaping (String) -> Void,
+        downloadAndShareURL: @escaping (URL) -> Void
     ) -> some View {
         self
             // Intercept link taps from MarkdownView: download server file URLs
@@ -4823,17 +6233,28 @@ private extension View {
                 guard let url = notification.userInfo?["url"] as? URL else { return }
                 let urlString = url.absoluteString
                 let base = viewModel.serverBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                if !base.isEmpty, urlString.hasPrefix(base), urlString.contains("/api/v1/files/"),
-                   urlString.hasSuffix("/content") {
-                    let parts = urlString.split(separator: "/")
-                    if let filesIdx = parts.firstIndex(of: "files"),
-                       filesIdx + 1 < parts.count {
-                        let fileId = String(parts[filesIdx + 1])
-                        downloadAndShare(fileId)
-                        return
+
+                // Check if this URL belongs to the server
+                let isServerURL = !base.isEmpty && urlString.hasPrefix(base)
+
+                if isServerURL {
+                    // Known files API pattern: use existing fileId-based download
+                    if urlString.contains("/api/v1/files/"), urlString.hasSuffix("/content") {
+                        let parts = urlString.split(separator: "/")
+                        if let filesIdx = parts.firstIndex(of: "files"),
+                           filesIdx + 1 < parts.count {
+                            let fileId = String(parts[filesIdx + 1])
+                            downloadAndShare(fileId)
+                            return
+                        }
                     }
+                    // All other server-hosted URLs (e.g. /cache/files/…, /uploads/…):
+                    // download via authenticated raw GET so the user gets the file
+                    // with credentials injected, not a Safari 401.
+                    downloadAndShareURL(url)
+                } else {
+                    openURL(url)
                 }
-                UIApplication.shared.open(url)
             }
             // Handle sendPrompt bridge calls from InlineVisualizerView.
             .onReceive(NotificationCenter.default.publisher(for: .vizSendPrompt)) { notification in
@@ -4905,6 +6326,125 @@ struct ActionConfirmRequest: Identifiable {
     let id = UUID()
     let title: String
     let message: String
+}
+
+// MARK: - SubagentResultSheet
+
+/// A sheet that shows the full content of a background sub-agent completion message.
+/// Presented when the user taps the "Background sub-agent finished" banner in the chat.
+struct SubagentResultSheet: View {
+    let message: ChatMessage
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Delegation ID badge
+                    if let delegId = message.subagentDelegationId, !delegId.isEmpty {
+                        Text(delegId)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Color(.secondarySystemBackground))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+
+                    // Full content rendered as markdown
+                    AssistantMessageContent(
+                        content: message.content,
+                        isStreaming: false,
+                        messageEmbeds: message.embeds,
+                        authToken: nil,
+                        serverBaseURL: "",
+                        apiClient: nil
+                    )
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .navigationTitle("Sub-agent Result")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - AssistantEditSheet
+
+/// A bottom sheet for editing an assistant message content in-place.
+/// Mirrors WebUI's `editMessage(id, { content }, false)` — saves the edited
+/// text directly to the history tree + server without creating a new branch
+/// or triggering AI regeneration.
+struct AssistantEditSheet: View {
+    @Binding var text: String
+    @FocusState.Binding var isFocused: Bool
+    let onSave: () -> Void
+    let onCancel: () -> Void
+
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack {
+                Button(action: onCancel) {
+                    Text("Cancel")
+                        .scaledFont(size: 16)
+                        .foregroundStyle(theme.textSecondary)
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+
+                Text("Edit Response")
+                    .scaledFont(size: 17, weight: .semibold)
+                    .foregroundStyle(theme.textPrimary)
+
+                Spacer()
+
+                Button(action: onSave) {
+                    Text("Save")
+                        .scaledFont(size: 16, weight: .semibold)
+                        .foregroundStyle(
+                            text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                ? theme.textTertiary
+                                : theme.brandPrimary
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.horizontal, Spacing.md)
+            .padding(.vertical, 14)
+            .overlay(alignment: .bottom) { Divider().opacity(0.5) }
+
+            // Text editor
+            TextEditor(text: $text)
+                .scaledFont(size: 15)
+                .foregroundStyle(theme.textPrimary)
+                .tint(theme.brandPrimary)
+                .focused($isFocused)
+                .scrollContentBackground(.hidden)
+                .background(theme.background)
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, Spacing.sm)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(theme.background.ignoresSafeArea())
+        .onAppear {
+            // Auto-focus the editor when the sheet opens
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isFocused = true
+            }
+        }
+    }
 }
 
 // MARK: - ActionInputSheet

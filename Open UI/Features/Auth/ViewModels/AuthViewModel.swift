@@ -136,6 +136,13 @@ final class AuthViewModel {
         return currentUser?.permissions?.features ?? .allEnabled
     }
 
+    /// The resolved chat permissions for the current user from `/api/v1/auths/`.
+    /// Admins always get full access. `nil` permissions (older server) defaults to full access.
+    var chatPermissions: GroupChatPermissions {
+        guard currentUser?.role != .admin else { return GroupChatPermissions() }
+        return currentUser?.permissions?.chat ?? GroupChatPermissions()
+    }
+
     /// Whether the current user can access ANY workspace tab.
     var hasAnyWorkspaceAccess: Bool {
         let wp = workspacePermissions
@@ -278,6 +285,34 @@ final class AuthViewModel {
         var normalizedURL = trimmed
         if normalizedURL.hasSuffix("/") {
             normalizedURL = String(normalizedURL.dropLast())
+        }
+
+        // Strip known OpenWebUI frontend route path segments that users sometimes
+        // accidentally paste into the server URL field.
+        // e.g. "https://server.com/auth"     → "https://server.com"
+        //      "https://server.com/chat/new"  → "https://server.com"
+        //      "https://server.com/s/xyz"     → "https://server.com"
+        // These are SPA routes, not the server root — sending health checks to
+        // "https://server.com/auth/health" returns HTML (the login page) which
+        // incorrectly triggers the proxy-auth WebView detection.
+        if let tempURL = URL(string: normalizedURL.hasPrefix("http") ? normalizedURL : "https://\(normalizedURL)"),
+           let host = tempURL.host {
+            let knownFrontendPaths = ["/auth", "/chat", "/s/", "/d/"]
+            let path = tempURL.path
+            let matchesFrontendRoute = knownFrontendPaths.contains(where: {
+                path == $0 || path.hasPrefix($0 + "/") || ($0.hasSuffix("/") && path.hasPrefix($0))
+            })
+            if matchesFrontendRoute {
+                let scheme = tempURL.scheme ?? "https"
+                var stripped = "\(scheme)://\(host)"
+                if let port = tempURL.port,
+                   !((scheme == "https" && port == 443) || (scheme == "http" && port == 80)) {
+                    stripped += ":\(port)"
+                }
+                logger.info("🔌 [connect] Stripping frontend route path '\(path)' from URL: \(normalizedURL) → \(stripped)")
+                normalizedURL = stripped
+                serverURL = stripped
+            }
         }
 
         // Ensure scheme — only allow http/https for security (reject file://, javascript://, etc.)
@@ -804,6 +839,10 @@ final class AuthViewModel {
         // restore a signed-out user.
         clearCachedUser()
 
+        // Clear the active account pointer so the signed-out account appears
+        // as selectable (not greyed-out) in the account picker on return.
+        serverConfigStore.clearActiveAccountOnActiveServer()
+
         // SECURITY FIX: Clear SSO/OAuth cookies so the next user can't
         // auto-authenticate with the previous user's SSO session.
         clearSSOCookies()
@@ -1108,7 +1147,14 @@ final class AuthViewModel {
 
     /// Called by `ProxyAuthView` when the user has authenticated through the upstream
     /// proxy portal and we've captured the resulting session cookies.
-    func resumeAfterProxyAuth(_ cookies: [String: String], userAgent: String) {
+    ///
+    /// - Parameters:
+    ///   - cookies: Session cookies captured from the proxy WebView.
+    ///   - userAgent: The WebView's User-Agent string (needed for UA-bound proxies).
+    ///   - jwtToken: Optional JWT token captured from OpenWebUI's cookie/localStorage.
+    ///     Present when the proxy uses trusted headers and OpenWebUI auto-authenticated
+    ///     the user — allows skipping the second sign-in step entirely.
+    func resumeAfterProxyAuth(_ cookies: [String: String], userAgent: String, jwtToken: String? = nil) {
         showProxyAuthChallenge = false
         guard let urlString = pendingProxyAuthURL else {
             errorMessage = "Could not resume connection after proxy sign-in."
@@ -1140,6 +1186,14 @@ final class AuthViewModel {
 
         serverURL = urlString
         pendingProxyAuthURL = nil
+
+        // JWT fast-path: if the proxy WebView captured a valid JWT token, skip the
+        // full connect flow and use it directly (oauth2-proxy trusted-header setups).
+        if let token = jwtToken {
+            logger.info("🔑 [resumeAfterProxyAuth] JWT captured — fast-path login via SSO token")
+            Task { await loginWithSSOToken(token) }
+            return
+        }
 
         Task { await connectSkippingProxyCheck(normalizedURL: urlString, proxyAuthCookies: cookies, userAgent: userAgent) }
     }
@@ -1348,7 +1402,17 @@ final class AuthViewModel {
     }
 
     /// Removes the cached user (called on sign out).
+    ///
+    /// IMPORTANT: Must delete the per-server key (used by `cacheCurrentUser()`) as well
+    /// as the legacy global key. Previously this only deleted the global key, which meant
+    /// the per-server cached user was never actually removed — causing the app to restore
+    /// the signed-out user optimistically on the next launch.
     func clearCachedUser() {
+        // Delete the per-server key (matches what cacheCurrentUser() writes)
+        if let serverURL = serverConfigStore.activeServer?.url {
+            KeychainService.shared.deleteToken(forServer: "cached_user_\(serverURL)")
+        }
+        // Also delete the legacy global key (for older installs / fallback path)
         KeychainService.shared.deleteToken(forServer: "cached_user_\(Self.cachedUserKey)")
         // Also clean up legacy UserDefaults entry if present
         UserDefaults.standard.removeObject(forKey: Self.cachedUserKey)

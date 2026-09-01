@@ -107,6 +107,14 @@ actor StreamingPipeline {
     private var drainAccumulator: Double = 0
     private var isFinishing: Bool = false
 
+    // MARK: - Session generation counter
+    //
+    // Incremented every time resetState() is called (i.e. every begin/abort).
+    // Each drain tick captures the generation at its start; if it has changed
+    // by the time publishSnapshot is called the tick was orphaned by a reset
+    // or abort and its snapshot must be discarded.
+    private var sessionGeneration: Int = 0
+
     // MARK: - Dynamic drain constants
     //
     // The typewriter reveals content so that displayed text lags behind the server
@@ -120,25 +128,39 @@ actor StreamingPipeline {
     // simply to keep the typewriter effect perceptible while not making the user
     // wait for content that is already fully available on the server.
 
-    /// Target drain latency in frames. At 60 Hz ≈ 133 ms of lag.
-    /// Keeps a short but perceptible typewriter effect on fast models.
-    private let targetLatencyFrames: Double = 8
+    /// Target drain latency in frames. At 60 Hz ≈ 667 ms of lag.
+    /// Builds up a backlog of 2-3 server bursts to ensure continuous smooth drain.
+    private let targetLatencyFrames: Double = 40
 
     /// Shorter latency used once the server has finished sending.
     /// Drains any remaining buffer quickly so the user isn't waiting.
     private let finishingLatencyFrames: Double = 6
 
-    /// Minimum chars/frame floor — ensures at least a trickle even with tiny buffers.
-    private let minRatePerFrame: Double = 0.3
+    /// Minimum chars/frame floor — raised from 0.3 to 1.5 so brief server pauses
+    /// don't crater the reveal rate to near-zero.  At 60 Hz, 1.5 chars/frame = 90
+    /// chars/sec — enough to keep a smooth visible trickle across a 100ms gap.
+    private let minRatePerFrame: Double = 1.5
 
-    /// Maximum chars/frame cap — 15 chars/frame × 60 Hz = 900 chars/sec,
-    /// enough to reveal a fast model's output without visible lag.
-    private let maxRatePerFrame: Double = 15.0
+    /// Maximum chars/frame cap — 80 chars/frame × 60 Hz = 4800 chars/sec,
+    /// enough to quickly drain accumulated backlog while maintaining smooth flow.
+    private let maxRatePerFrame: Double = 80.0
 
-    /// Perceptual keep-back: reserve this many chars so the drain never fully
-    /// empties the buffer mid-stream (avoids the "catch-up then pause" stutter).
+    /// Perceptual keep-back: reserve chars so the drain never fully empties the
+    /// buffer mid-stream (avoids the "catch-up then pause" stutter when the server
+    /// briefly stalls). Set to 60 to absorb multiple server burst gaps smoothly.
     /// Disabled when isFinishing (we want to drain to zero).
-    private let tailReserve: Int = 2
+    private let tailReserve: Int = 60
+
+    // MARK: - EMA smoothing for drain rate
+
+    /// Exponential moving average of `currentBuffered`, used to smooth the drain rate
+    /// across brief server pauses. Without EMA, a single tick where buffered drops to
+    /// near-zero craters the rate to minRatePerFrame and causes visible stutter.
+    ///
+    /// α = 0.15: strong smoothing (85% of rate comes from history, 15% from this tick).
+    private let emaAlpha: Double = 0.15
+    /// Running EMA of buffered char count. Initialised to 0; warms up within ~4 frames.
+    private var bufferedEMA: Double = 0
 
     // MARK: - Boundary cache (computed off-main, published via snapshot)
 
@@ -166,7 +188,7 @@ actor StreamingPipeline {
         let hasClosed: Bool
     }
     private var _toolCallFlagsCache: (contentCount: Int, flags: ToolCallBlockFlags)?
-    private var _reasoningFlagsCache: (contentCount: Int, hasClosed: Bool)?
+    private var _reasoningFlagsCache: (contentCount: Int, flags: ToolCallBlockFlags)?
     /// Cached result of `hasOpenLivePreviewFence`, keyed by utf8.count.
     private var _livePreviewFenceCache: (contentCount: Int, hasOpen: Bool)?
 
@@ -186,6 +208,19 @@ actor StreamingPipeline {
         startTimer()
     }
 
+    /// Begin a streaming session for a **continue** response.
+    ///
+    /// Pre-seeds the buffer with `prefix` (the already-displayed content) and sets
+    /// `displayedCount = prefix.count` so the typewriter drain cursor starts at the
+    /// END of the existing content. Only new tokens appended beyond the prefix will
+    /// be revealed — the old content is never re-streamed.
+    func beginWithPrefix(_ prefix: String) {
+        resetState()
+        buffer = prefix
+        displayedCount = prefix.count
+        startTimer()
+    }
+
     /// Append new server content. Content is always the full accumulated string.
     func append(_ content: String) {
         guard !isFinishing else { return }
@@ -195,6 +230,22 @@ actor StreamingPipeline {
     /// Signal that the server has finished sending tokens.
     /// The timer keeps running to drain the remaining buffer, then stops.
     func finish() {
+        isFinishing = true
+    }
+
+    /// Atomically update the final content AND mark the session as finishing.
+    ///
+    /// When the `done:true` event arrives, `updateContent` and `endStreaming` are
+    /// called back-to-back from the main actor. Both schedule Tasks on this actor.
+    /// If the finish Task runs before the content Task, the buffer update is dropped
+    /// (guarded by `!isFinishing`). This single call eliminates that race by setting
+    /// both in the same actor turn.
+    func setFinalContent(_ content: String) {
+        // Only update the buffer if not already finishing — prevents overwriting
+        // an aborted session that may have been reset between the Task dispatch
+        // and this actor call.
+        guard !isFinishing else { return }
+        buffer = content
         isFinishing = true
     }
 
@@ -210,10 +261,12 @@ actor StreamingPipeline {
     // MARK: - Internal reset
 
     private func resetState() {
+        sessionGeneration &+= 1   // wraps safely; O(1); guards orphaned drain ticks
         buffer = ""
         displayedCount = 0
         drainAccumulator = 0
         isFinishing = false
+        bufferedEMA = 0
         frozenToolBoundaryOffset = 0
         frozenReasoningBoundaryOffset = 0
         frozenProseBoundaryOffset = 0
@@ -259,24 +312,12 @@ actor StreamingPipeline {
             return
         }
 
-        // ── Tool call freeze ──────────────────────────────────────────────────
-        // Hold the drain cursor while an unclosed tool_calls block is in-flight
-        // so the user never sees partial HTML. Fall through when isFinishing so
-        // content isn't left invisible if the server completes without closing.
-        if toolCallFlags(for: full).hasUnclosed {
+        // ── Tool call / reasoning freeze ──────────────────────────────────────
+        // Hold the drain cursor while an unclosed tool_calls or reasoning block
+        // is in-flight so the user never sees partial HTML. Fall through when
+        // isFinishing so content isn't left invisible if the server closes abnormally.
+        if toolCallFlags(for: full).hasUnclosed || reasoningFlags(for: full).hasUnclosed {
             if !isFinishing { return }
-        }
-
-        // ── Closed reasoning fast-forward ─────────────────────────────────────
-        if hasClosedReasoningBlock(full) {
-            if let lastEnd = Self.lastReasoningDetailsEnd(in: full), displayedCount < lastEnd {
-                let endIdx = full.index(full.startIndex, offsetBy: lastEnd)
-                displayedCount = lastEnd
-                frozenReasoningBoundaryOffset = lastEnd
-                drainAccumulator = 0
-                publishSnapshot(displayContent: String(full[..<endIdx]))
-                return
-            }
         }
 
         // ── Closed tool call fast-forward ─────────────────────────────────────
@@ -286,6 +327,30 @@ actor StreamingPipeline {
                 displayedCount = lastEnd
                 frozenToolBoundaryOffset = lastEnd
                 drainAccumulator = 0
+                // Pre-warm EMA so post-fast-forward prose drains at full rate immediately.
+                // Without this, bufferedEMA starts at 0 and takes 4+ frames to warm up,
+                // causing only 1-2 chars/frame (90 chars/sec) to drain initially — appearing
+                // as a visible "pause" after the tool call block appears.
+                let remainingAfterBlock = full.count - lastEnd
+                bufferedEMA = Double(remainingAfterBlock)
+                publishSnapshot(displayContent: String(full[..<endIdx]))
+                return
+            }
+        }
+
+        // ── Closed reasoning fast-forward ─────────────────────────────────────
+        // Mirrors the tool_calls path: once a <details type="reasoning"> block
+        // closes, instantly reveal everything up to and including it so the
+        // ToolCallView renderer (not StreamingMarkdownView) shows it.
+        if reasoningFlags(for: full).hasClosed {
+            if let lastEnd = Self.lastReasoningDetailsEnd(in: full), displayedCount < lastEnd {
+                let endIdx = full.index(full.startIndex, offsetBy: lastEnd)
+                displayedCount = lastEnd
+                frozenReasoningBoundaryOffset = max(frozenReasoningBoundaryOffset, lastEnd)
+                drainAccumulator = 0
+                // Pre-warm EMA for reasoning blocks (same as tool_calls above).
+                let remainingAfterBlock = full.count - lastEnd
+                bufferedEMA = Double(remainingAfterBlock)
                 publishSnapshot(displayContent: String(full[..<endIdx]))
                 return
             }
@@ -313,7 +378,17 @@ actor StreamingPipeline {
         guard effectiveBuffered > 0 else { return }
 
         let latency = isFinishing ? finishingLatencyFrames : targetLatencyFrames
-        let baseRate = Double(effectiveBuffered) / latency
+
+        // ── EMA-smoothed drain rate ───────────────────────────────────────────
+        // Update the exponential moving average of buffered char count.
+        // This smooths across brief server stalls: when the server pauses and
+        // effectiveBuffered briefly drops to near-zero, the EMA stays elevated
+        // (reflecting the recent healthy buffer depth), so baseRate stays above
+        // minRatePerFrame and the reveal doesn't crater to a near-halt.
+        // α = 0.25: 75% history + 25% this tick — strong but responsive smoothing.
+        bufferedEMA = bufferedEMA * (1.0 - emaAlpha) + Double(effectiveBuffered) * emaAlpha
+        let smoothedBuffered = isFinishing ? Double(effectiveBuffered) : max(Double(effectiveBuffered), bufferedEMA)
+        let baseRate = smoothedBuffered / latency
         let charsThisFrame: Double
 
         // Live-preview code fences (html/svg/mermaid/chart) are rendered by a
@@ -482,143 +557,455 @@ actor StreamingPipeline {
             return cached.flags
         }
 
+        // Pre-check: if there's a <details opening tag whose closing > hasn't
+        // arrived yet, we can't read its type attribute — freeze immediately so
+        // partial HTML never leaks to MarkdownView. This closes the race window
+        // where "<details type=\"tool_calls\"" arrives character-by-character
+        // and content.contains("tool_calls") is still false for the first few ticks.
+        if let detailsRange = content.range(of: "<details") {
+            if !content[detailsRange.upperBound...].contains(">") {
+                let flags = ToolCallBlockFlags(hasUnclosed: true, hasClosed: false)
+                _toolCallFlagsCache = (count, flags)
+                return flags
+            }
+        }
+
         guard content.contains("tool_calls") else {
             let flags = ToolCallBlockFlags(hasUnclosed: false, hasClosed: false)
             _toolCallFlagsCache = (count, flags)
             return flags
         }
 
-        var toolCallOpenCount = 0
-        var totalCloseCount = 0
-        var reasoningOpenCount = 0
+        // Depth-aware scan: walk the content tracking nesting so that nested
+        // <details> elements inside tool result HTML (e.g. from web search results)
+        // don't corrupt the open/close accounting.
+        //
+        // For each <details type="tool_calls"> opener we track a depth counter.
+        // Only a </details> that brings depth back to 0 truly closes the block.
+        // Plain <details> (non-tool_calls, non-reasoning) inside the body bump
+        // depth and their corresponding </details> only decrements it — they do
+        // NOT count as closing the outer tool_calls block.
+        var hasUnclosed = false
+        var hasClosed = false
 
         var idx = content.startIndex
         while idx < content.endIndex {
-            if content[idx] == "<" {
-                let detailsTag = "<details"
-                if content[idx...].hasPrefix(detailsTag) {
-                    let afterDetails = content.index(idx, offsetBy: detailsTag.count, limitedBy: content.endIndex) ?? content.endIndex
-                    var tagEnd = afterDetails
-                    while tagEnd < content.endIndex && content[tagEnd] != ">" {
-                        tagEnd = content.index(after: tagEnd)
+            guard content[idx] == "<" else {
+                idx = content.index(after: idx)
+                continue
+            }
+
+            let detailsOpenTag = "<details"
+            if content[idx...].hasPrefix(detailsOpenTag) {
+                // Scan the opening tag with quote-awareness so we correctly
+                // find the attribute type even when values contain ">".
+                let afterDetails = content.index(idx, offsetBy: detailsOpenTag.count,
+                                                 limitedBy: content.endIndex) ?? content.endIndex
+                var j = afterDetails
+                var inQuote: Character? = nil
+                var openingTagEnd: String.Index? = nil
+                while j < content.endIndex {
+                    let ch = content[j]
+                    if let q = inQuote {
+                        if ch == q { inQuote = nil }
+                    } else {
+                        if ch == "\"" || ch == "'" { inQuote = ch }
+                        else if ch == ">" { openingTagEnd = content.index(after: j); break }
                     }
-                    let tagContent = String(content[idx..<tagEnd]).lowercased()
-                    if tagContent.contains("tool_calls") {
-                        toolCallOpenCount += 1
-                    } else if tagContent.contains("type=\"reasoning\"") || tagContent.contains("type='reasoning'") {
-                        reasoningOpenCount += 1
-                    }
-                    idx = tagEnd < content.endIndex ? content.index(after: tagEnd) : content.endIndex
-                    continue
+                    j = content.index(after: j)
                 }
-                let closeTag = "</details>"
-                if content[idx...].hasPrefix(closeTag) {
-                    totalCloseCount += 1
-                    idx = content.index(idx, offsetBy: closeTag.count, limitedBy: content.endIndex) ?? content.endIndex
+
+                guard let tagBodyStart = openingTagEnd else {
+                    // Opening tag not yet closed — block is still in-flight.
+                    hasUnclosed = true
+                    break
+                }
+
+                let tagText = String(content[idx..<tagBodyStart]).lowercased()
+                let isToolCallsBlock = tagText.contains("type=\"tool_calls\"")
+                                    || tagText.contains("type='tool_calls'")
+
+                if isToolCallsBlock {
+                    // Depth-track to find the matching </details> for this block.
+                    var k = tagBodyStart
+                    var depth = 1
+
+                    while k < content.endIndex && depth > 0 {
+                        guard let nextLt = content[k...].firstIndex(of: "<") else {
+                            depth = -1; break   // closing tag not yet arrived
+                        }
+                        let peekEnd = content.index(nextLt, offsetBy: 9,
+                                                    limitedBy: content.endIndex) ?? content.endIndex
+                        let peek = content[nextLt..<peekEnd].lowercased()
+
+                        if peek.hasPrefix("</details") {
+                            var m = content.index(nextLt, offsetBy: 9,
+                                                  limitedBy: content.endIndex) ?? content.endIndex
+                            while m < content.endIndex && content[m] != ">" {
+                                m = content.index(after: m)
+                            }
+                            if m < content.endIndex {
+                                depth -= 1
+                                k = content.index(after: m)
+                            } else {
+                                depth = -1; break
+                            }
+                        } else if peek.hasPrefix("<details") {
+                            // Nested <details> — skip its opening tag and bump depth.
+                            let nestedNameEnd = content.index(nextLt, offsetBy: 8,
+                                                              limitedBy: content.endIndex) ?? content.endIndex
+                            var m = nestedNameEnd
+                            var nestedInQuote: Character? = nil
+                            var foundClose = false
+                            while m < content.endIndex {
+                                let ch = content[m]
+                                if let q = nestedInQuote {
+                                    if ch == q { nestedInQuote = nil }
+                                } else {
+                                    if ch == "\"" || ch == "'" { nestedInQuote = ch }
+                                    else if ch == ">" { foundClose = true; m = content.index(after: m); break }
+                                }
+                                m = content.index(after: m)
+                            }
+                            if foundClose { depth += 1; k = m }
+                            else { depth = -1; break }
+                        } else {
+                            k = content.index(after: nextLt)
+                        }
+                    }
+
+                    if depth == 0 {
+                        hasClosed = true
+                    } else {
+                        // depth < 0 means the closing tag hasn't arrived yet.
+                        hasUnclosed = true
+                    }
+
+                    idx = k   // resume scan after this block
+                    continue
+                } else {
+                    idx = tagBodyStart
                     continue
                 }
             }
+
+            // Not a <details opener — advance past this '<'
             idx = content.index(after: idx)
         }
 
-        let toolCallCloseCount = max(0, totalCloseCount - reasoningOpenCount)
-        let hasUnclosed = toolCallOpenCount > toolCallCloseCount
-        let hasClosed = toolCallOpenCount > 0 && !hasUnclosed
         let flags = ToolCallBlockFlags(hasUnclosed: hasUnclosed, hasClosed: hasClosed)
         _toolCallFlagsCache = (count, flags)
         return flags
     }
 
-    private func hasClosedReasoningBlock(_ content: String) -> Bool {
-        let count = content.utf8.count
-        if let cached = _reasoningFlagsCache, cached.contentCount == count {
-            return cached.hasClosed
-        }
-        guard content.contains("reasoning"), content.contains("</details>") else {
-            _reasoningFlagsCache = (count, false)
-            return false
-        }
+    private static func lastToolCallDetailsEnd(in content: String) -> Int? {
+        guard content.contains("tool_calls") else { return nil }
 
-        var reasoningOpenCount = 0
-        var totalCloseCount = 0
-        var idx = content.startIndex
-        while idx < content.endIndex {
-            if content[idx] == "<" {
-                let detailsTag = "<details"
-                if content[idx...].hasPrefix(detailsTag) {
-                    let afterDetails = content.index(idx, offsetBy: detailsTag.count, limitedBy: content.endIndex) ?? content.endIndex
-                    var tagEnd = afterDetails
-                    while tagEnd < content.endIndex && content[tagEnd] != ">" {
-                        tagEnd = content.index(after: tagEnd)
-                    }
-                    let tagContent = String(content[idx..<tagEnd]).lowercased()
-                    if tagContent.contains("reasoning") { reasoningOpenCount += 1 }
-                    idx = tagEnd < content.endIndex ? content.index(after: tagEnd) : content.endIndex
-                    continue
-                }
-                let closeTag = "</details>"
-                if content[idx...].hasPrefix(closeTag) {
-                    totalCloseCount += 1
-                    idx = content.index(idx, offsetBy: closeTag.count, limitedBy: content.endIndex) ?? content.endIndex
-                    continue
-                }
-            }
-            idx = content.index(after: idx)
-        }
-        let hasClosed = reasoningOpenCount > 0 && totalCloseCount >= reasoningOpenCount
-        _reasoningFlagsCache = (count, hasClosed)
-        return hasClosed
-    }
-
-    private static func lastReasoningDetailsEnd(in content: String) -> Int? {
-        let closeTag = "</details>"
-        guard content.contains("reasoning"), content.contains(closeTag) else { return nil }
-        var closeEnds: [String.Index] = []
-        var sr = content.startIndex..<content.endIndex
-        while let r = content.range(of: closeTag, options: .caseInsensitive, range: sr) {
-            closeEnds.append(r.upperBound); sr = r.upperBound..<content.endIndex
-        }
-        var openStarts: [String.Index] = []
-        sr = content.startIndex..<content.endIndex
-        while let r = content.range(of: "<details", options: .caseInsensitive, range: sr) {
-            openStarts.append(r.lowerBound); sr = r.upperBound..<content.endIndex
-        }
-        guard !closeEnds.isEmpty && !openStarts.isEmpty else { return nil }
+        // Depth-aware scan: find the end of each top-level <details type="tool_calls">
+        // block by tracking nesting so that nested <details> inside tool result HTML
+        // (e.g. from web search result snippets) don't cause early termination.
         var lastEnd: String.Index? = nil
-        let pairCount = min(closeEnds.count, openStarts.count)
-        for i in 0..<pairCount {
-            if let tagEnd = content.range(of: ">", range: openStarts[i]..<content.endIndex) {
-                let tagText = String(content[openStarts[i]..<tagEnd.upperBound]).lowercased()
-                if tagText.contains("reasoning") { lastEnd = closeEnds[i] }
+        var idx = content.startIndex
+
+        while idx < content.endIndex {
+            guard content[idx] == "<" else { idx = content.index(after: idx); continue }
+
+            let detailsOpenTag = "<details"
+            guard content[idx...].hasPrefix(detailsOpenTag) else {
+                idx = content.index(after: idx); continue
             }
+
+            // Scan the opening tag quote-aware to read the full attribute string.
+            let afterDetails = content.index(idx, offsetBy: detailsOpenTag.count,
+                                             limitedBy: content.endIndex) ?? content.endIndex
+            var j = afterDetails
+            var inQuote: Character? = nil
+            var openingTagEnd: String.Index? = nil
+            while j < content.endIndex {
+                let ch = content[j]
+                if let q = inQuote {
+                    if ch == q { inQuote = nil }
+                } else {
+                    if ch == "\"" || ch == "'" { inQuote = ch }
+                    else if ch == ">" { openingTagEnd = content.index(after: j); break }
+                }
+                j = content.index(after: j)
+            }
+
+            guard let tagBodyStart = openingTagEnd else { break }   // mid-stream
+
+            let tagText = String(content[idx..<tagBodyStart]).lowercased()
+            let isToolCallsBlock = tagText.contains("type=\"tool_calls\"")
+                                || tagText.contains("type='tool_calls'")
+
+            guard isToolCallsBlock else { idx = tagBodyStart; continue }
+
+            // Depth-track to find the matching </details> for this tool_calls block.
+            var k = tagBodyStart
+            var depth = 1
+
+            while k < content.endIndex && depth > 0 {
+                guard let nextLt = content[k...].firstIndex(of: "<") else {
+                    depth = -1; break
+                }
+                let peekEnd = content.index(nextLt, offsetBy: 9,
+                                            limitedBy: content.endIndex) ?? content.endIndex
+                let peek = content[nextLt..<peekEnd].lowercased()
+
+                if peek.hasPrefix("</details") {
+                    var m = content.index(nextLt, offsetBy: 9,
+                                          limitedBy: content.endIndex) ?? content.endIndex
+                    while m < content.endIndex && content[m] != ">" {
+                        m = content.index(after: m)
+                    }
+                    if m < content.endIndex {
+                        depth -= 1
+                        k = content.index(after: m)
+                        if depth == 0 { lastEnd = k }
+                    } else {
+                        depth = -1; break
+                    }
+                } else if peek.hasPrefix("<details") {
+                    let nestedNameEnd = content.index(nextLt, offsetBy: 8,
+                                                      limitedBy: content.endIndex) ?? content.endIndex
+                    var m = nestedNameEnd
+                    var nestedInQuote: Character? = nil
+                    var foundClose = false
+                    while m < content.endIndex {
+                        let ch = content[m]
+                        if let q = nestedInQuote {
+                            if ch == q { nestedInQuote = nil }
+                        } else {
+                            if ch == "\"" || ch == "'" { nestedInQuote = ch }
+                            else if ch == ">" { foundClose = true; m = content.index(after: m); break }
+                        }
+                        m = content.index(after: m)
+                    }
+                    if foundClose { depth += 1; k = m }
+                    else { depth = -1; break }
+                } else {
+                    k = content.index(after: nextLt)
+                }
+            }
+
+            idx = (depth == 0) ? k : content.endIndex
         }
+
         guard let e = lastEnd else { return nil }
         return content.distance(from: content.startIndex, to: e)
     }
 
-    private static func lastToolCallDetailsEnd(in content: String) -> Int? {
-        let closeTag = "</details>"
-        guard content.contains("tool_calls"), content.contains(closeTag) else { return nil }
-        var closeEnds: [String.Index] = []
-        var sr = content.startIndex..<content.endIndex
-        while let r = content.range(of: closeTag, options: .caseInsensitive, range: sr) {
-            closeEnds.append(r.upperBound); sr = r.upperBound..<content.endIndex
+    // MARK: - Reasoning block detection (mirrors tool_calls path)
+
+    /// Returns flags for `<details type="reasoning">` blocks — same semantics as
+    /// `toolCallFlags` but scans for `type="reasoning"` instead of `type="tool_calls"`.
+    /// This is intentionally a separate function (not merged with toolCallFlags) so
+    /// each has its own cache key and neither pollutes the other's cached state.
+    private func reasoningFlags(for content: String) -> ToolCallBlockFlags {
+        guard content.contains("reasoning") else {
+            return ToolCallBlockFlags(hasUnclosed: false, hasClosed: false)
         }
-        var openStarts: [String.Index] = []
-        sr = content.startIndex..<content.endIndex
-        while let r = content.range(of: "<details", options: .caseInsensitive, range: sr) {
-            openStarts.append(r.lowerBound); sr = r.upperBound..<content.endIndex
+
+        let count = content.utf8.count
+        if let cached = _reasoningFlagsCache, cached.contentCount == count {
+            return cached.flags
         }
-        guard !closeEnds.isEmpty && !openStarts.isEmpty else { return nil }
-        var lastToolCallEnd: String.Index? = nil
-        let pairCount = min(closeEnds.count, openStarts.count)
-        for i in 0..<pairCount {
-            if let tagEnd = content.range(of: ">", range: openStarts[i]..<content.endIndex) {
-                let tagText = String(content[openStarts[i]..<tagEnd.upperBound]).lowercased()
-                if tagText.contains("tool_calls") { lastToolCallEnd = closeEnds[i] }
+
+        var hasUnclosed = false
+        var hasClosed = false
+        var idx = content.startIndex
+
+        while idx < content.endIndex {
+            guard content[idx] == "<" else { idx = content.index(after: idx); continue }
+
+            let detailsOpenTag = "<details"
+            guard content[idx...].hasPrefix(detailsOpenTag) else {
+                idx = content.index(after: idx); continue
+            }
+
+            let afterDetails = content.index(idx, offsetBy: detailsOpenTag.count,
+                                             limitedBy: content.endIndex) ?? content.endIndex
+            var j = afterDetails
+            var inQuote: Character? = nil
+            var openingTagEnd: String.Index? = nil
+            while j < content.endIndex {
+                let ch = content[j]
+                if let q = inQuote {
+                    if ch == q { inQuote = nil }
+                } else {
+                    if ch == "\"" || ch == "'" { inQuote = ch }
+                    else if ch == ">" { openingTagEnd = content.index(after: j); break }
+                }
+                j = content.index(after: j)
+            }
+
+            guard let tagBodyStart = openingTagEnd else {
+                hasUnclosed = true
+                break
+            }
+
+            let tagText = String(content[idx..<tagBodyStart]).lowercased()
+            let isReasoningBlock = tagText.contains("type=\"reasoning\"")
+                                || tagText.contains("type='reasoning'")
+
+            if isReasoningBlock {
+                var k = tagBodyStart
+                var depth = 1
+
+                while k < content.endIndex && depth > 0 {
+                    guard let nextLt = content[k...].firstIndex(of: "<") else {
+                        depth = -1; break
+                    }
+                    let peekEnd = content.index(nextLt, offsetBy: 9,
+                                                limitedBy: content.endIndex) ?? content.endIndex
+                    let peek = content[nextLt..<peekEnd].lowercased()
+
+                    if peek.hasPrefix("</details") {
+                        var m = content.index(nextLt, offsetBy: 9,
+                                              limitedBy: content.endIndex) ?? content.endIndex
+                        while m < content.endIndex && content[m] != ">" {
+                            m = content.index(after: m)
+                        }
+                        if m < content.endIndex {
+                            depth -= 1
+                            k = content.index(after: m)
+                        } else {
+                            depth = -1; break
+                        }
+                    } else if peek.hasPrefix("<details") {
+                        let nestedNameEnd = content.index(nextLt, offsetBy: 8,
+                                                          limitedBy: content.endIndex) ?? content.endIndex
+                        var m = nestedNameEnd
+                        var nestedInQuote: Character? = nil
+                        var foundClose = false
+                        while m < content.endIndex {
+                            let ch = content[m]
+                            if let q = nestedInQuote {
+                                if ch == q { nestedInQuote = nil }
+                            } else {
+                                if ch == "\"" || ch == "'" { nestedInQuote = ch }
+                                else if ch == ">" { foundClose = true; m = content.index(after: m); break }
+                            }
+                            m = content.index(after: m)
+                        }
+                        if foundClose { depth += 1; k = m }
+                        else { depth = -1; break }
+                    } else {
+                        k = content.index(after: nextLt)
+                    }
+                }
+
+                if depth == 0 {
+                    hasClosed = true
+                } else {
+                    hasUnclosed = true
+                }
+
+                idx = k
+                continue
+            } else {
+                idx = tagBodyStart
+                continue
             }
         }
-        guard let e = lastToolCallEnd else { return nil }
+
+        let flags = ToolCallBlockFlags(hasUnclosed: hasUnclosed, hasClosed: hasClosed)
+        _reasoningFlagsCache = (count, flags)
+        return flags
+    }
+
+    /// Depth-aware scan that finds the character offset just after the last closed
+    /// `<details type="reasoning">...</details>` block in `content`.
+    /// Returns `nil` if no closed reasoning block exists.
+    private static func lastReasoningDetailsEnd(in content: String) -> Int? {
+        guard content.contains("reasoning") else { return nil }
+
+        var lastEnd: String.Index? = nil
+        var idx = content.startIndex
+
+        while idx < content.endIndex {
+            guard content[idx] == "<" else { idx = content.index(after: idx); continue }
+
+            let detailsOpenTag = "<details"
+            guard content[idx...].hasPrefix(detailsOpenTag) else {
+                idx = content.index(after: idx); continue
+            }
+
+            let afterDetails = content.index(idx, offsetBy: detailsOpenTag.count,
+                                             limitedBy: content.endIndex) ?? content.endIndex
+            var j = afterDetails
+            var inQuote: Character? = nil
+            var openingTagEnd: String.Index? = nil
+            while j < content.endIndex {
+                let ch = content[j]
+                if let q = inQuote {
+                    if ch == q { inQuote = nil }
+                } else {
+                    if ch == "\"" || ch == "'" { inQuote = ch }
+                    else if ch == ">" { openingTagEnd = content.index(after: j); break }
+                }
+                j = content.index(after: j)
+            }
+
+            guard let tagBodyStart = openingTagEnd else { break }
+
+            let tagText = String(content[idx..<tagBodyStart]).lowercased()
+            let isReasoningBlock = tagText.contains("type=\"reasoning\"")
+                                || tagText.contains("type='reasoning'")
+
+            guard isReasoningBlock else { idx = tagBodyStart; continue }
+
+            var k = tagBodyStart
+            var depth = 1
+
+            while k < content.endIndex && depth > 0 {
+                guard let nextLt = content[k...].firstIndex(of: "<") else {
+                    depth = -1; break
+                }
+                let peekEnd = content.index(nextLt, offsetBy: 9,
+                                            limitedBy: content.endIndex) ?? content.endIndex
+                let peek = content[nextLt..<peekEnd].lowercased()
+
+                if peek.hasPrefix("</details") {
+                    var m = content.index(nextLt, offsetBy: 9,
+                                          limitedBy: content.endIndex) ?? content.endIndex
+                    while m < content.endIndex && content[m] != ">" {
+                        m = content.index(after: m)
+                    }
+                    if m < content.endIndex {
+                        depth -= 1
+                        k = content.index(after: m)
+                        if depth == 0 { lastEnd = k }
+                    } else {
+                        depth = -1; break
+                    }
+                } else if peek.hasPrefix("<details") {
+                    let nestedNameEnd = content.index(nextLt, offsetBy: 8,
+                                                      limitedBy: content.endIndex) ?? content.endIndex
+                    var m = nestedNameEnd
+                    var nestedInQuote: Character? = nil
+                    var foundClose = false
+                    while m < content.endIndex {
+                        let ch = content[m]
+                        if let q = nestedInQuote {
+                            if ch == q { nestedInQuote = nil }
+                        } else {
+                            if ch == "\"" || ch == "'" { nestedInQuote = ch }
+                            else if ch == ">" { foundClose = true; m = content.index(after: m); break }
+                        }
+                        m = content.index(after: m)
+                    }
+                    if foundClose { depth += 1; k = m }
+                    else { depth = -1; break }
+                } else {
+                    k = content.index(after: nextLt)
+                }
+            }
+
+            idx = (depth == 0) ? k : content.endIndex
+        }
+
+        guard let e = lastEnd else { return nil }
         return content.distance(from: content.startIndex, to: e)
     }
 

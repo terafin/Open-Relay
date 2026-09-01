@@ -147,17 +147,15 @@ struct UsageInfoPopover: View {
                 rows.append(UsageRow(label: humanize(key), formattedValue: "", indent: indent, isHeader: true))
                 rows += flattenUsage(nested, indent: indent + 1)
             } else {
-                if isNullOrZero(value) { continue }
+                if isNull(value) { continue }
                 rows.append(UsageRow(label: humanize(key), formattedValue: formatValue(value), indent: indent, isHeader: false))
             }
         }
         return rows
     }
 
-    private func isNullOrZero(_ value: Any) -> Bool {
-        if value is NSNull { return true }
-        if let i = value as? Int, i == 0 { return true }
-        return false
+    private func isNull(_ value: Any) -> Bool {
+        return value is NSNull
     }
 
     private func formatValue(_ value: Any) -> String {

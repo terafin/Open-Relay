@@ -133,6 +133,32 @@ final class FolderManager: @unchecked Sendable {
         try await apiClient.moveFolderParent(id: id, parentId: parentId)
     }
 
+    // MARK: - Sharing
+
+    /// Fetches all folders shared with the current user (not owned by them).
+    func fetchSharedFolders() async throws -> [ChatFolder] {
+        let rawFolders = try await apiClient.getSharedFolders()
+        return rawFolders.compactMap { ChatFolder(json: $0) }
+    }
+
+    /// Replaces the access grants for a folder.
+    /// Pass `isPublic: true` to include a wildcard `*` grant.
+    /// Pass an empty grants array and `isPublic: false` to make private.
+    func updateFolderAccess(folder: ChatFolder) async throws -> ChatFolder {
+        let payload = folder.buildGrantsPayload()
+        let raw = try await apiClient.updateFolderAccessGrants(id: folder.id, grants: payload)
+        guard let updated = ChatFolder(json: raw) else {
+            throw FolderError.invalidResponse
+        }
+        return updated
+    }
+
+    /// Fetches chats inside a shared folder, with a `readonly` flag.
+    /// Returns `(chats, readonly)` — `readonly` is true when the caller only has read permission.
+    func fetchSharedFolderChats(folderId: String) async throws -> (chats: [Conversation], readonly: Bool) {
+        return try await apiClient.getSharedFolderChats(folderId: folderId)
+    }
+
     // MARK: - Expand / Collapse (debounced)
 
     /// Tracks the last synced expanded state per folder to avoid redundant calls.

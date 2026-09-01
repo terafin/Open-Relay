@@ -61,6 +61,12 @@ struct MainChatView: View {
 
     /// The conversation currently being viewed. `nil` = new chat.
     @State private var activeConversationId: String?
+    /// Tracks the conversation the user last tapped so deferred navigation tasks can
+    /// guard against being superseded by a subsequent tap before they fire.
+    @State private var pendingNavigationId: String?
+    /// Extra blur applied to the content pane during a chat-switch transition.
+    /// Ramps up on tap (hiding the stale chat) and fades out once the new chat loads.
+    @State private var contentTransitionBlur: CGFloat = 0
 
     /// The channel currently being viewed. When set, replaces main content with ChannelDetailView.
     @State private var activeChannelId: String?
@@ -94,6 +100,12 @@ struct MainChatView: View {
     /// started will be assigned to this folder with its system prompt.
     @State private var activeFolderWorkspaceId: String?
 
+    /// The folder object for the current workspace — captured synchronously at
+    /// selection time so the background image is available on the FIRST render,
+    /// before `setActiveFolder`'s async detail fetch completes.
+    /// Updated reactively when `activeFolderDetail` arrives (which has full meta).
+    @State private var activeFolderForWorkspace: ChatFolder?
+
     /// Tracks whether socket reconnect handler has been registered.
     @State private var hasRegisteredSocketHandlers = false
 
@@ -102,6 +114,7 @@ struct MainChatView: View {
 
     /// Top-level section collapse states (persisted across launches).
     @AppStorage("sidebar_folders_expanded") private var foldersExpanded: Bool = true
+    @AppStorage("sidebar_shared_folders_expanded") private var sharedFoldersExpanded: Bool = true
     @AppStorage("sidebar_channels_expanded") private var channelsExpanded: Bool = true
     @AppStorage("sidebar_chats_expanded") private var chatsExpanded: Bool = true
     /// Tracks which time-group sub-sections are collapsed (e.g. "Pinned", "Today").
@@ -149,6 +162,16 @@ struct MainChatView: View {
     /// Using a local bool avoids triggering the global `availableUpdate` state
     /// during the drawer-open animation, which previously caused lag.
     @State private var showUpdateSheet = false
+
+    /// Controls the on-device TTS model download sheet shown before opening a voice call.
+    @State private var showModelDownloadSheet = false
+    /// Pending voice call action stored while the model download sheet is visible.
+    @State private var pendingVoiceCallAction: (() -> Void)?
+
+    // MARK: Photo picker (window-level)
+    // Owned here so AnimatedPhotoPicker renders outside ChatDetailView's
+    // safeAreaInset-shrunk ZStack and can truly cover the full screen.
+    @State private var showAnimatedPhotoPicker = false
 
     /// Whether title is being AI-generated.
     @State private var isGeneratingTitle = false
@@ -280,8 +303,8 @@ struct MainChatView: View {
             .offset(x: combinedContentOffset)
             .scaleEffect(combinedContentScale, anchor: .center)
             .clipShape(RoundedRectangle(cornerRadius: combinedContentCornerRadius, style: .continuous))
-            // Blur the main content as panels open
-            .blur(radius: maxPanelFraction * 8)
+            // Blur the main content as panels open, plus extra blur during chat-switch transitions
+            .blur(radius: maxPanelFraction * 8 + contentTransitionBlur)
             // Shadow on the active edge: left when drawer open, right when file browser open
             .shadow(color: .black.opacity(0.18 * drawerFraction), radius: 20, x: -4)
             .shadow(color: .black.opacity(0.18 * fileBrowserFraction), radius: 20, x: 4)
@@ -486,6 +509,27 @@ struct MainChatView: View {
                     )
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
+
+            // ── Layer 4: AnimatedPhotoPicker at window level ──────────────────
+            // Rendered here — outside the NavigationStack and its safeAreaInset
+            // modifiers — so the panel can cover the full physical screen including
+            // the input bar and home indicator region.
+            AnimatedPhotoPicker(
+                isPresented: showAnimatedPhotoPicker,
+                onConfirm: { assets in
+                    // Deliver the selected assets to whichever ChatDetailView is active.
+                    // ChatDetailView observes this notification and calls processSelectedPHAssets.
+                    NotificationCenter.default.post(
+                        name: .openUIPhotoPickerConfirm,
+                        object: nil,
+                        userInfo: ["assets": assets]
+                    )
+                    showAnimatedPhotoPicker = false
+                },
+                onDismiss: {
+                    showAnimatedPhotoPicker = false
+                }
+            )
         }
     }
 
@@ -548,7 +592,11 @@ struct MainChatView: View {
                 }
             }) {
                 if let voiceCallVM = router.voiceCallViewModel {
-                    VoiceCallView(viewModel: voiceCallVM)
+                    VoiceCallView(
+                        viewModel: voiceCallVM,
+                        onMinimize: { router.minimizeVoiceCall() },
+                        onDismiss: { router.dismissVoiceCall() }
+                    )
                         .environment(dependencies)
                         .presentationDetents([.medium, .large])
                         .presentationDragIndicator(.hidden)
@@ -765,6 +813,36 @@ struct MainChatView: View {
                 .environment(dependencies)
                 .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
             }
+            // On-device TTS model download sheet — shown before a voice call when model is not ready
+            .sheet(isPresented: $showModelDownloadSheet, onDismiss: {
+                pendingVoiceCallAction = nil
+            }) {
+                modelDownloadSheetContent()
+            }
+    }
+
+    // MARK: - Model Download Sheet Content (extracted to avoid type-check timeout)
+
+    @ViewBuilder
+    private func modelDownloadSheetContent() -> some View {
+        VoiceCallModelDownloadSheet(
+            ttsService: dependencies.textToSpeechService,
+            onReady: {
+                showModelDownloadSheet = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    pendingVoiceCallAction?()
+                    pendingVoiceCallAction = nil
+                }
+            },
+            onCancel: {
+                showModelDownloadSheet = false
+                pendingVoiceCallAction = nil
+            }
+        )
+        .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+        .presentationDetents([.height(420)])
+        .presentationDragIndicator(.hidden)
+        .presentationCornerRadius(24)
     }
 
     // MARK: - Rename Conversation Sheet (extracted for readability)
@@ -1087,7 +1165,13 @@ struct MainChatView: View {
                         modelName: modelName
                     )
                 }
-                router.presentVoiceCall(viewModel: voiceCallVM)
+                // Intercept: show download sheet if on-device model not yet ready
+                if dependencies.textToSpeechService.needsOnDeviceModelDownload {
+                    pendingVoiceCallAction = { router.presentVoiceCall(viewModel: voiceCallVM) }
+                    showModelDownloadSheet = true
+                } else {
+                    router.presentVoiceCall(viewModel: voiceCallVM)
+                }
             }
             .onReceive(NotificationCenter.default.publisher(for: .conversationListNeedsRefresh)) { _ in
                 Task {
@@ -1095,7 +1179,26 @@ struct MainChatView: View {
                         group.addTask { await listViewModel.refreshConversations() }
                         group.addTask { await listViewModel.folderViewModel.refreshFolders() }
                     }
+                    // If a folder workspace is active, reload its chats so that any new
+                    // conversation created inside the folder appears under the folder
+                    // instead of appearing stale or under normal chats.
+                    if let folderId = activeFolderWorkspaceId {
+                        let folderVM = listViewModel.folderViewModel
+                        if let idx = folderVM.folders.firstIndex(where: { $0.id == folderId }) {
+                            folderVM.folders[idx].isExpanded = true
+                            await folderVM.loadChatsIfNeeded(for: folderVM.folders[idx])
+                        }
+                    }
                 }
+            }
+            // Folder workspace chat list row tapped — open that conversation while
+            // keeping the folder context (background image) intact.
+            .onReceive(NotificationCenter.default.publisher(for: .folderWorkspaceChatSelected)) { notification in
+                guard let chatId = notification.object as? String else { return }
+                activeConversationId = chatId
+                // Keep activeFolderWorkspaceId set so the background image persists
+                SharedDataService.shared.saveLastActiveConversationId(chatId)
+                closeDrawer()
             }
     }
 
@@ -1114,6 +1217,7 @@ struct MainChatView: View {
                 activeConversationId = nil
                 activeChannelId = nil
                 activeFolderWorkspaceId = nil
+                activeFolderForWorkspace = nil
                 // 2. Clear the conversation/folder list immediately so stale chats vanish.
                 listViewModel.clearAll()
                 // 3. Purge all cached ChatViewModels (holds old account's messages/models).
@@ -1123,6 +1227,24 @@ struct MainChatView: View {
                 newChatGeneration += 1
                 // 5. Reload all lists from the server for the new account.
                 Task { await refreshAllDataOnForeground() }
+            }
+            // Reactive update: when setActiveFolder() async fetch completes, update
+            // activeFolderForWorkspace with the full detail (includes meta/backgroundImageUrl).
+            // This fires after the synchronous capture in onSelectFolder, upgrading the
+            // partial flat-list record to the complete server-fetched record.
+            .onChange(of: listViewModel.folderViewModel.activeFolderDetail) { _, detail in
+                guard let detail,
+                      detail.id == activeFolderWorkspaceId else { return }
+                // Merge: use the full detail's meta/data (backgroundImageUrl, icon, systemPrompt,
+                // modelIds) but preserve the chats from the flat list folder so both the
+                // background image AND the recent-chats list are always visible together.
+                var merged = detail
+                if merged.chats.isEmpty,
+                   let flatFolder = listViewModel.folderViewModel.folders.first(where: { $0.id == detail.id }),
+                   !flatFolder.chats.isEmpty {
+                    merged.chats = flatFolder.chats
+                }
+                activeFolderForWorkspace = merged
             }
     }
 
@@ -1189,7 +1311,7 @@ struct MainChatView: View {
         // Dismiss keyboard immediately so it doesn't overlap the drawer
         UIApplication.shared.sendAction(
             #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+        withAnimation(MicroAnimation.panelOpen) {
             showDrawer = true
             dragOffset = 0
         }
@@ -1208,7 +1330,7 @@ struct MainChatView: View {
 
     /// Animates the drawer to fully closed and resets drag offset.
     private func closeDrawerAnimated() {
-        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+        withAnimation(MicroAnimation.panelClose) {
             showDrawer = false
             dragOffset = 0
         }
@@ -1227,7 +1349,7 @@ struct MainChatView: View {
     /// Animates the file browser to fully open.
     private func openFileBrowserAnimated() {
         configureTerminalBrowserIfNeeded()
-        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+        withAnimation(MicroAnimation.panelOpen) {
             showFileBrowser = true
             fileBrowserDragOffset = 0
         }
@@ -1241,7 +1363,7 @@ struct MainChatView: View {
 
     /// Animates the file browser to fully closed.
     private func closeFileBrowserAnimated() {
-        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+        withAnimation(MicroAnimation.panelClose) {
             showFileBrowser = false
             fileBrowserDragOffset = 0
         }
@@ -1252,32 +1374,32 @@ struct MainChatView: View {
     // MARK: - New Chat
 
     private func startNewChat() {
-        // If we're already on the new-chat screen AND a transcription is in
-        // progress, stay put — destroying the VM would silently discard the work.
-        let alreadyOnNewChat = activeConversationId == nil && activeChannelId == nil
         let currentNewVM = dependencies.activeChatStore.viewModel(for: nil)
-        if alreadyOnNewChat && currentNewVM.hasActiveTranscriptions {
+
+        // If a transcription is running on the new-chat VM, stay put regardless
+        // of whether we're already on the new-chat screen.
+        if currentNewVM.hasActiveTranscriptions {
             return
         }
 
-        // If we're NOT already on the new-chat screen, just navigate there
-        // without resetting the VM — the transcription can keep running.
-        // Only remove + recreate the VM when there's no ongoing work.
-        let shouldRecreateVM = !currentNewVM.hasActiveTranscriptions
-        if shouldRecreateVM {
+        // The navbar "new chat" button always navigates to a plain new chat —
+        // never inside a folder workspace, regardless of the current context.
+        // Always remove + recreate the VM so derived state (random prompt cards,
+        // terminal status, model avatar, etc.) refreshes correctly. The view
+        // identity bump (.id change) is what drives those @State resets.
+        // All state mutations are wrapped in a non-animating transaction so the
+        // swap is an instant replacement with no slide/fade animation.
+        var txn = Transaction()
+        txn.disablesAnimations = true
+        withTransaction(txn) {
             dependencies.activeChatStore.remove(nil)
-        }
-
-        // Keep ALL state mutations in one withAnimation pass so SwiftUI
-        // performs a single animated view-identity transition (no flash/revert).
-        withAnimation(.easeInOut(duration: 0.2)) {
             activeConversationId = nil
             activeChannelId = nil
             activeFolderWorkspaceId = nil
-            if shouldRecreateVM {
-                newChatGeneration += 1
-            }
+            activeFolderForWorkspace = nil
+            newChatGeneration += 1
         }
+
         // Clear the persisted last-active conversation so a cold launch after
         // this explicit new-chat navigation does not restore the old chat.
         SharedDataService.shared.saveLastActiveConversationId(nil)
@@ -1294,22 +1416,31 @@ struct MainChatView: View {
         if let channelId = activeChannelId {
             // Show channel detail inline (same as how chats work)
             ChannelDetailView(channelId: channelId, channelListVM: channelListVM)
+                .onToggleDrawer { toggleDrawer() }
                 .id("channel-\(channelId)")
         } else if let conversationId = activeConversationId {
+            // Pass activeFolderForWorkspace (captured synchronously at folder-selection time)
+            // so the background image persists while viewing any chat inside the folder.
             ChatDetailView(
                 conversationId: conversationId,
-                viewModel: dependencies.activeChatStore.viewModel(for: conversationId)
+                viewModel: dependencies.activeChatStore.viewModel(for: conversationId),
+                folderWorkspace: activeFolderForWorkspace
             )
             .onDeleteChat { startNewChat() }
             .onToggleDrawer { toggleDrawer() }
             .onNewChat { startNewChat() }
+            .onOpenFileBrowser { openFileBrowserAnimated() }
+            .onPhotoPickerRequest { showAnimatedPhotoPicker = true }
             .id(conversationId)
         } else if let folderWorkspaceId = activeFolderWorkspaceId {
             // Folder workspace: new chat screen locked to this folder.
             // The ChatViewModel receives folder context so when the user
             // sends a message the chat is created inside this folder.
             let vm = dependencies.activeChatStore.viewModel(for: nil)
-            let folder = listViewModel.folderViewModel.folders.first { $0.id == folderWorkspaceId }
+            // Use activeFolderForWorkspace (captured synchronously, updated reactively)
+            // so background image and meta are available from the very first frame.
+            let folder = activeFolderForWorkspace
+                ?? listViewModel.folderViewModel.folders.first { $0.id == folderWorkspaceId }
                 ?? listViewModel.folderViewModel.activeFolderDetail
             ChatDetailView(
                 viewModel: vm,
@@ -1317,6 +1448,8 @@ struct MainChatView: View {
             )
             .onToggleDrawer { toggleDrawer() }
             .onNewChat { startNewChat() }
+            .onOpenFileBrowser { openFileBrowserAnimated() }
+            .onPhotoPickerRequest { showAnimatedPhotoPicker = true }
             .id("folder-workspace-\(folderWorkspaceId)-\(newChatGeneration)")
             .onAppear {
                 // Set folder context on the VM so new chats are created in this folder
@@ -1336,6 +1469,8 @@ struct MainChatView: View {
             )
             .onToggleDrawer { toggleDrawer() }
             .onNewChat { startNewChat() }
+            .onOpenFileBrowser { openFileBrowserAnimated() }
+            .onPhotoPickerRequest { showAnimatedPhotoPicker = true }
             .id("new-chat-\(newChatGeneration)")
         }
     }
@@ -1358,7 +1493,7 @@ struct MainChatView: View {
             if listViewModel.isSelectionMode {
                 selectionModeHeader
             } else {
-                searchBar
+                drawerHeader
             }
 
             // Conversation list grouped by time
@@ -1375,15 +1510,16 @@ struct MainChatView: View {
                         drawerFoldersSection(folderVM: folderVM)
                     }
 
+                    // ── SHARED WITH ME SECTION ───────────────────────────
+                    if foldersEnabled && !folderVM.sharedFolders.isEmpty {
+                        drawerSharedFoldersSection(folderVM: folderVM)
+                    }
+
                     // ── DIVIDER between Folders & Channels ──────────────
                     let channelsEnabled = dependencies.authViewModel.featurePermissions.channels
                         && (dependencies.authViewModel.backendConfig?.features?.enableChannels ?? true)
                     if (foldersEnabled && !folderVM.featureDisabled && !folderVM.folders.isEmpty) || (channelsEnabled && !channelListVM.channels.isEmpty) {
-                        Rectangle()
-                            .fill(theme.textTertiary.opacity(0.15))
-                            .frame(height: 1)
-                            .padding(.horizontal, Spacing.md)
-                            .padding(.vertical, Spacing.sm)
+                        sidebarDivider
                     }
 
                     // ── CHANNELS SECTION (shown only when enabled on server) ──
@@ -1391,43 +1527,32 @@ struct MainChatView: View {
                     VStack(alignment: .leading, spacing: 0) {
                         // Collapsible header
                         Button {
-                            withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                            withAnimation(MicroAnimation.snappy) {
                                 channelsExpanded.toggle()
                             }
                             Haptics.play(.light)
                         } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "chevron.down")
-                                    .scaledFont(size: 8, weight: .bold, context: .list)
-                                    .foregroundStyle(theme.textTertiary)
-                                    .rotationEffect(.degrees(channelsExpanded ? 0 : -90))
-                                    .animation(.easeInOut(duration: AnimDuration.fast), value: channelsExpanded)
-
-                                Image(systemName: "bubble.left.and.bubble.right")
-                                    .scaledFont(size: 10, weight: .semibold, context: .list)
-                                    .foregroundStyle(theme.textTertiary)
-                                Text("Channels")
-                                    .scaledFont(size: 12, weight: .medium, context: .list)
-                                    .fontWeight(.bold)
-                                    .foregroundStyle(theme.textTertiary)
-                                    .textCase(.uppercase)
-                                    .tracking(0.5)
-                                Spacer()
-
-                                // Create new channel directly (always visible)
-                                Button {
-                                    closeDrawer()
-                                    showCreateChannel = true
-                                } label: {
-                                    Image(systemName: "plus.bubble")
-                                        .scaledFont(size: 13, context: .list)
-                                        .foregroundStyle(theme.textTertiary)
+                            drawerSectionLabel(
+                                title: "Channels",
+                                icon: "bubble.left.and.bubble.right",
+                                isExpanded: channelsExpanded,
+                                trailingButton: {
+                                    AnyView(
+                                        Button {
+                                            closeDrawer()
+                                            showCreateChannel = true
+                                        } label: {
+                                            Image(systemName: "plus")
+                                                .scaledFont(size: 11, weight: .semibold, context: .list)
+                                                .foregroundStyle(theme.textTertiary)
+                                                .frame(width: 22, height: 22)
+                                                .background(theme.surfaceContainer)
+                                                .clipShape(Circle())
+                                        }
+                                        .buttonStyle(.plain)
+                                    )
                                 }
-                                .buttonStyle(.plain)
-                            }
-                            .padding(.horizontal, Spacing.md)
-                            .padding(.vertical, Spacing.sm)
-                            .contentShape(Rectangle())
+                            )
                         }
                         .buttonStyle(.plain)
 
@@ -1437,7 +1562,7 @@ struct MainChatView: View {
                                     .scaledFont(size: 13, context: .list)
                                     .foregroundStyle(theme.textTertiary)
                                     .padding(.horizontal, Spacing.md)
-                                    .padding(.vertical, 4)
+                                    .padding(.vertical, 6)
                             } else {
                                 // DMs first
                                 if !channelListVM.dmChannels.isEmpty {
@@ -1466,53 +1591,31 @@ struct MainChatView: View {
                     } // end if channelsEnabled
 
                     // ── DIVIDER between Channels & Chats ──────────────
-                    Rectangle()
-                        .fill(theme.textTertiary.opacity(0.15))
-                        .frame(height: 1)
-                        .padding(.horizontal, Spacing.md)
-                        .padding(.vertical, Spacing.sm)
+                    sidebarDivider
 
                     // ── CHATS SECTION (entire section is a drop zone) ─
-                    let hasAnyChats = !listViewModel.pinnedConversations.isEmpty
-                        || !listViewModel.groupedConversations.isEmpty
+                    // Compute once — groupedConversations is O(n) + DateFormatter usage;
+                    // evaluating it multiple times per render frame wastes CPU during
+                    // drawer open/close animations.
+                    let groupedChats = listViewModel.groupedConversations
+                    let pinnedChats = listViewModel.pinnedConversations
+                    let hasAnyChats = !pinnedChats.isEmpty || !groupedChats.isEmpty
 
                     if hasAnyChats || !folderVM.folders.isEmpty {
                         VStack(alignment: .leading, spacing: 0) {
                             // Collapsible header (also acts as drop zone indicator)
                             Button {
-                                withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                                withAnimation(MicroAnimation.snappy) {
                                     chatsExpanded.toggle()
                                 }
                                 Haptics.play(.light)
                             } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "chevron.down")
-                                        .scaledFont(size: 8, weight: .bold, context: .list)
-                                        .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
-                                        .rotationEffect(.degrees(chatsExpanded ? 0 : -90))
-                                        .animation(.easeInOut(duration: AnimDuration.fast), value: chatsExpanded)
-
-                                    Image(systemName: "bubble.left.and.text.bubble.right")
-                                        .scaledFont(size: 10, weight: .semibold, context: .list)
-                                        .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
-                                    Text("Chats")
-                                        .scaledFont(size: 12, weight: .medium, context: .list)
-                                        .fontWeight(.bold)
-                                        .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
-                                        .textCase(.uppercase)
-                                        .tracking(0.5)
-                                    if drawerChatsDropActive {
-                                        Text("Drop here")
-                                            .scaledFont(size: 12, weight: .medium, context: .list)
-                                            .foregroundStyle(theme.brandPrimary)
-                                            .transition(.opacity)
-                                    }
-                                    Spacer()
-                                }
-                                .padding(.horizontal, Spacing.md)
-                                .padding(.top, Spacing.sm)
-                                .padding(.bottom, Spacing.xs)
-                                .contentShape(Rectangle())
+                                drawerSectionLabel(
+                                    title: drawerChatsDropActive ? "Drop here" : "Chats",
+                                    icon: "bubble.left.and.text.bubble.right",
+                                    isExpanded: chatsExpanded,
+                                    tintOverride: drawerChatsDropActive ? theme.brandPrimary : nil
+                                )
                             }
                             .buttonStyle(.plain)
 
@@ -1522,13 +1625,13 @@ struct MainChatView: View {
                                 // so they don't prevent lazy row creation.
                                 LazyVStack(alignment: .leading, spacing: 0, pinnedViews: []) {
                                     // ── Pinned sub-section ────────────────────
-                                    if !listViewModel.pinnedConversations.isEmpty {
+                                    if !pinnedChats.isEmpty {
                                         // Section header
                                         drawerSubSectionHeader(title: "Pinned", sectionKey: "Pinned")
 
                                         // Rows — only rendered when section is expanded
                                         if !collapsedSections.contains("Pinned") {
-                                            ForEach(listViewModel.pinnedConversations) { conversation in
+                                            ForEach(pinnedChats) { conversation in
                                                 drawerConversationRow(conversation)
                                                     .frame(minHeight: 36)
                                             }
@@ -1536,7 +1639,7 @@ struct MainChatView: View {
                                     }
 
                                     // ── Time-grouped sub-sections ─────────────
-                                    ForEach(listViewModel.groupedConversations, id: \.0) { group in
+                                    ForEach(groupedChats, id: \.0) { group in
                                         let sectionKey = group.0
                                         let isCollapsed = collapsedSections.contains(sectionKey)
 
@@ -1609,6 +1712,303 @@ struct MainChatView: View {
             }
         }
         .background(theme.background)
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(theme.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.08))
+                .frame(width: 0.5)
+                .ignoresSafeArea()
+        }
+    }
+
+    // MARK: - Drawer Header (Clean Action Bar + Animated Search)
+
+    /// Simplified header: just action buttons (no user name/server URL) + animated search pill.
+    /// User identity lives exclusively in the bottom bar.
+    @State private var isSearchFocused: Bool = false
+
+    private var drawerHeader: some View {
+        VStack(spacing: 0) {
+            // Action row: server icon (left), new chat + chat-management menu (right)
+            HStack(spacing: 8) {
+                // Server favicon — tapping opens Settings
+                Button {
+                    closeDrawer()
+                    showSettings = true
+                } label: {
+                    serverFaviconView
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Server Settings")
+
+                Spacer()
+
+                // New Chat
+                Button {
+                    closeDrawer()
+                    startNewChat()
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                        .scaledFont(size: 16, weight: .medium)
+                        .foregroundStyle(theme.textSecondary)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("New Chat")
+
+                // Chat management menu (select, archive, delete, archived/shared chats)
+                Menu {
+                    if !listViewModel.conversations.isEmpty {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) { listViewModel.toggleSelectionMode() }
+                        } label: {
+                            Label("Select Chats", systemImage: "checkmark.circle")
+                        }
+                        Button {
+                            listViewModel.showArchiveAllConfirmation = true
+                        } label: {
+                            Label("Archive All", systemImage: "archivebox")
+                        }
+                        Button(role: .destructive) {
+                            showDeleteAllConfirmation = true
+                        } label: {
+                            Label("Delete All", systemImage: "trash")
+                        }
+                        Divider()
+                    }
+                    Button {
+                        closeDrawer(); showArchivedChats = true
+                    } label: {
+                        Label("Archived Chats", systemImage: "archivebox")
+                    }
+                    Button {
+                        closeDrawer(); showSharedChats = true
+                    } label: {
+                        Label("Shared Chats", systemImage: "link.circle")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .scaledFont(size: 16, weight: .medium)
+                        .foregroundStyle(theme.textSecondary)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Rectangle())
+                }
+            }
+            .padding(.horizontal, Spacing.md)
+            .padding(.top, 14)
+            .padding(.bottom, 10)
+
+            // Animated search pill
+            sidebarSearchPill
+        }
+    }
+
+    // MARK: - Server Favicon View
+
+    @ViewBuilder
+    private var serverFaviconView: some View {
+        let baseURL = dependencies.apiClient?.baseURL ?? ""
+        let authToken = dependencies.apiClient?.network.authToken
+
+        Group {
+            if !baseURL.isEmpty,
+               let faviconURL = URL(string: "\(baseURL)/favicon.ico") {
+                AsyncImage(url: faviconURL) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    default:
+                        Image("AppIconImage")
+                            .resizable()
+                            .scaledToFill()
+                    }
+                }
+            } else {
+                Image("AppIconImage")
+                    .resizable()
+                    .scaledToFill()
+            }
+        }
+        .frame(width: 28, height: 28)
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(theme.isDark ? Color.white.opacity(0.1) : Color.black.opacity(0.08), lineWidth: 0.5)
+        )
+    }
+
+    // MARK: - Sidebar Search Pill (Animated)
+
+    private var sidebarSearchPill: some View {
+        HStack(spacing: 8) {
+            // Magnifying glass — shifts to brandPrimary when focused or searching
+            Image(systemName: "magnifyingglass")
+                .scaledFont(size: 13, weight: .medium, context: .list)
+                .foregroundStyle(
+                    (isSearchFocused || !listViewModel.searchText.isEmpty)
+                        ? theme.brandPrimary
+                        : theme.textTertiary
+                )
+                .animation(.easeInOut(duration: 0.2), value: isSearchFocused)
+
+            TextField("Search conversations…", text: $listViewModel.searchText) { focused in
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                    isSearchFocused = focused
+                }
+            }
+            .scaledFont(size: 14, context: .list)
+            .foregroundStyle(theme.textPrimary)
+            .tint(theme.brandPrimary)
+
+            // Clear button — appears when there's text
+            if !listViewModel.searchText.isEmpty {
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                        listViewModel.searchText = ""
+                    }
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .scaledFont(size: 14, context: .list)
+                        .foregroundStyle(theme.textTertiary)
+                }
+                .transition(.asymmetric(
+                    insertion: .scale(scale: 0.7).combined(with: .opacity),
+                    removal: .scale(scale: 0.7).combined(with: .opacity)
+                ))
+            }
+
+            // Filter icon (idle) OR cancel (searching)
+            if isSearchFocused || !listViewModel.searchText.isEmpty {
+                Button {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        listViewModel.searchText = ""
+                        isSearchFocused = false
+                        UIApplication.shared.sendAction(
+                            #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    }
+                } label: {
+                    Text("Cancel")
+                        .scaledFont(size: 14, weight: .medium, context: .list)
+                        .foregroundStyle(theme.brandPrimary)
+                }
+                .transition(.asymmetric(
+                    insertion: .move(edge: .trailing).combined(with: .opacity),
+                    removal: .move(edge: .trailing).combined(with: .opacity)
+                ))
+            } else {
+                Menu {
+                    if !listViewModel.conversations.isEmpty {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) { listViewModel.toggleSelectionMode() }
+                        } label: {
+                            Label("Select Chats", systemImage: "checkmark.circle")
+                        }
+                        Button {
+                            listViewModel.showArchiveAllConfirmation = true
+                        } label: {
+                            Label("Archive All", systemImage: "archivebox")
+                        }
+                        Button(role: .destructive) {
+                            showDeleteAllConfirmation = true
+                        } label: {
+                            Label("Delete All", systemImage: "trash")
+                        }
+                        Divider()
+                    }
+                    Button {
+                        closeDrawer(); showArchivedChats = true
+                    } label: {
+                        Label("Archived Chats", systemImage: "archivebox")
+                    }
+                    Button {
+                        closeDrawer(); showSharedChats = true
+                    } label: {
+                        Label("Shared Chats", systemImage: "link.circle")
+                    }
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .scaledFont(size: 13, weight: .medium, context: .list)
+                        .foregroundStyle(theme.textTertiary)
+                }
+                .transition(.asymmetric(
+                    insertion: .opacity,
+                    removal: .opacity
+                ))
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(
+                    (isSearchFocused || !listViewModel.searchText.isEmpty)
+                        ? theme.surfaceContainer
+                        : theme.surfaceContainer.opacity(0.6)
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(
+                    (isSearchFocused || !listViewModel.searchText.isEmpty)
+                        ? theme.brandPrimary.opacity(0.35)
+                        : Color.clear,
+                    lineWidth: 1
+                )
+        )
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isSearchFocused)
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: listViewModel.searchText.isEmpty)
+        .padding(.horizontal, Spacing.md)
+        .padding(.bottom, Spacing.sm)
+    }
+
+    // MARK: - Sidebar Divider
+
+    private var sidebarDivider: some View {
+        Rectangle()
+            .fill(theme.textTertiary.opacity(0.1))
+            .frame(height: 1)
+            .padding(.horizontal, Spacing.md)
+            .padding(.vertical, 6)
+    }
+
+    // MARK: - Drawer Section Label (reusable header for collapsible sections)
+
+    @ViewBuilder
+    private func drawerSectionLabel(
+        title: String,
+        icon: String,
+        isExpanded: Bool,
+        tintOverride: Color? = nil,
+        trailingButton: (() -> AnyView)? = nil
+    ) -> some View {
+        let labelColor = tintOverride ?? theme.textTertiary
+        HStack(spacing: 6) {
+            Image(systemName: "chevron.down")
+                .scaledFont(size: 9, weight: .bold, context: .list)
+                .foregroundStyle(labelColor)
+                .rotationEffect(.degrees(isExpanded ? 0 : -90))
+                .animation(MicroAnimation.snappy, value: isExpanded)
+
+            Image(systemName: icon)
+                .scaledFont(size: 10, weight: .semibold, context: .list)
+                .foregroundStyle(labelColor)
+
+            Text(title)
+                .scaledFont(size: 11, weight: .bold, context: .list)
+                .foregroundStyle(labelColor)
+                .textCase(.uppercase)
+                .tracking(0.6)
+
+            Spacer()
+
+            if let trailingButton {
+                trailingButton()
+            }
+        }
+        .padding(.horizontal, Spacing.md)
+        .padding(.vertical, Spacing.sm)
+        .contentShape(Rectangle())
     }
 
     // MARK: - Selection Mode Header
@@ -1883,7 +2283,7 @@ struct MainChatView: View {
         VStack(alignment: .leading, spacing: 0) {
             // Section header with collapse toggle + "New Folder" button
             Button {
-                withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                withAnimation(MicroAnimation.snappy) {
                     foldersExpanded.toggle()
                 }
                 Haptics.play(.light)
@@ -1893,7 +2293,7 @@ struct MainChatView: View {
                         .scaledFont(size: 8, weight: .bold, context: .list)
                         .foregroundStyle(theme.textTertiary)
                         .rotationEffect(.degrees(foldersExpanded ? 0 : -90))
-                        .animation(.easeInOut(duration: AnimDuration.fast), value: foldersExpanded)
+                        .animation(MicroAnimation.snappy, value: foldersExpanded)
 
                     Image(systemName: "folder")
                         .scaledFont(size: 10, weight: .semibold, context: .list)
@@ -1934,17 +2334,65 @@ struct MainChatView: View {
                         activeFolderWorkspaceId: activeFolderWorkspaceId,
                         onSelectChat: { chatId in
                             activeConversationId = chatId
+                            // Keep activeFolderWorkspaceId set when opening a chat from
+                            // the sidebar so the folder background image persists.
+                            // Clear folder workspace when selecting a regular chat from the sidebar.
+                            // Folder chats use the .folderWorkspaceChatSelected notification path
+                            // to preserve the folder context — the generic onSelectChat path should not.
                             activeFolderWorkspaceId = nil
+                            activeFolderForWorkspace = nil
                             SharedDataService.shared.saveLastActiveConversationId(chatId)
                             closeDrawer()
                         },
                         onSelectFolder: { folderId in
-                            Task { await folderVM.setActiveFolder(folderId) }
-                            dependencies.activeChatStore.remove(nil)
-                            newChatGeneration += 1
                             activeFolderWorkspaceId = folderId
                             activeConversationId = nil
                             activeChannelId = nil
+                            dependencies.activeChatStore.remove(nil)
+                            newChatGeneration += 1
+                            // Set an immediate placeholder from the flat list (may lack meta)
+                            activeFolderForWorkspace = folderVM.folders.first { $0.id == folderId }
+                            Task {
+                                // Fetch full detail (background image URL, system prompt, models)
+                                await folderVM.setActiveFolder(folderId)
+                                // Pre-warm the folder background image so ChatDetailView has
+                                // an instant cache hit and shows no layout shift.
+                                if let bgUrl = folderVM.activeFolderDetail?.backgroundImageUrl,
+                                   !bgUrl.isEmpty, !bgUrl.hasPrefix("data:"),
+                                   let api = dependencies.apiClient {
+                                    let resolvedURL: URL?
+                                    if bgUrl.hasPrefix("http") {
+                                        resolvedURL = URL(string: bgUrl)
+                                    } else {
+                                        resolvedURL = URL(string: api.baseURL + bgUrl)
+                                    }
+                                    if let imgURL = resolvedURL {
+                                        Task(priority: .userInitiated) {
+                                            _ = await ImageCacheService.shared.loadImage(
+                                                from: imgURL,
+                                                authToken: api.network.authToken,
+                                                targetPixelSize: Int(UIScreen.main.bounds.width * UIScreen.main.scale)
+                                            )
+                                        }
+                                    }
+                                }
+                                // Load chats — they're fetched lazily and may be empty
+                                // if the folder was never expanded in the sidebar.
+                                if var flatFolder = folderVM.folders.first(where: { $0.id == folderId }) {
+                                    flatFolder.isExpanded = true   // satisfy the isExpanded guard in loadChatsIfNeeded
+                                    await folderVM.loadChatsIfNeeded(for: flatFolder)
+                                }
+                                // Merge: full detail has meta/background, flat list now has chats
+                                if let detail = folderVM.activeFolderDetail {
+                                    var merged = detail
+                                    if merged.chats.isEmpty,
+                                       let flatFolder = folderVM.folders.first(where: { $0.id == folderId }),
+                                       !flatFolder.chats.isEmpty {
+                                        merged.chats = flatFolder.chats
+                                    }
+                                    activeFolderForWorkspace = merged
+                                }
+                            }
                             closeDrawer()
                         },
                         onChatMoved: { chatId, targetFolderId in
@@ -1980,13 +2428,187 @@ struct MainChatView: View {
                             if activeConversationId == chatId {
                                 startNewChat()
                             }
+                        },
+                        onShareChat: { conversation in
+                            sharingConversation = conversation
+                        },
+                        onExportChat: { conversation, format in
+                            let mainFormat: ExportFormat
+                            switch format {
+                            case .json: mainFormat = .json
+                            case .txt: mainFormat = .txt
+                            case .pdf: mainFormat = .pdf
+                            }
+                            Task { await exportChat(conversation, format: mainFormat) }
+                        },
+                        onRenameChat: { conversation in
+                            renamingConversation = conversation
+                            renameText = conversation.title
+                        },
+                        onCloneChat: { conversation in
+                            Task {
+                                guard let manager = dependencies.conversationManager else { return }
+                                let cloned = try? await manager.cloneConversation(id: conversation.id)
+                                if let cloned {
+                                    await listViewModel.refreshConversations()
+                                    activeConversationId = cloned.id
+                                    closeDrawer()
+                                }
+                            }
+                        },
+                        onArchiveChat: { conversation in
+                            Task {
+                                await listViewModel.toggleArchive(conversation: conversation)
+                                if !conversation.archived && activeConversationId == conversation.id {
+                                    activeConversationId = nil
+                                }
+                            }
+                        },
+                        onShareFolder: { folder in
+                            Task { await folderVM.beginEdit(folder: folder) }
                         }
                     )
                     .padding(.horizontal, Spacing.sm)
                 }
             }
         }
-        .animation(.easeInOut(duration: AnimDuration.medium), value: folderVM.folders.map(\.id))
+        .animation(.easeInOut(duration: AnimDuration.medium), value: folderVM.folders.count)
+    }
+
+    // MARK: - Drawer Shared Folders Section
+
+    @ViewBuilder
+    private func drawerSharedFoldersSection(folderVM: FolderListViewModel) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Section header
+            Button {
+                withAnimation(MicroAnimation.snappy) {
+                    sharedFoldersExpanded.toggle()
+                }
+                Haptics.play(.light)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.down")
+                        .scaledFont(size: 8, weight: .bold, context: .list)
+                        .foregroundStyle(theme.textTertiary)
+                        .rotationEffect(.degrees(sharedFoldersExpanded ? 0 : -90))
+                        .animation(MicroAnimation.snappy, value: sharedFoldersExpanded)
+
+                    Image(systemName: "person.2.fill")
+                        .scaledFont(size: 10, weight: .semibold, context: .list)
+                        .foregroundStyle(theme.textTertiary)
+
+                    Text("Shared with Me")
+                        .scaledFont(size: 12, weight: .medium, context: .list)
+                        .fontWeight(.bold)
+                        .foregroundStyle(theme.textTertiary)
+                        .textCase(.uppercase)
+                        .tracking(0.5)
+
+                    Spacer()
+                }
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, Spacing.sm)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if sharedFoldersExpanded {
+                ForEach(folderVM.sharedFolders) { folder in
+                    sharedFolderRow(folder: folder, folderVM: folderVM)
+                        .padding(.horizontal, Spacing.sm)
+                }
+            }
+        }
+        .animation(.easeInOut(duration: AnimDuration.medium), value: folderVM.sharedFolders.count)
+    }
+
+    /// A single shared folder row — shows folder name with a shared badge.
+    /// Only allows "Open" action (no rename, delete, or move for shared folders).
+    @ViewBuilder
+    private func sharedFolderRow(folder: ChatFolder, folderVM: FolderListViewModel) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                Task { await folderVM.toggleSharedFolderExpanded(folder: folder) }
+                Haptics.play(.light)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .scaledFont(size: 8, weight: .bold, context: .list)
+                        .foregroundStyle(theme.textTertiary)
+                        .rotationEffect(.degrees(folder.isExpanded ? 90 : 0))
+                        .animation(MicroAnimation.snappy, value: folder.isExpanded)
+
+                    Image(systemName: "folder.fill.badge.person.crop")
+                        .scaledFont(size: 13, context: .list)
+                        .foregroundStyle(theme.brandPrimary.opacity(0.8))
+
+                    Text(folder.name)
+                        .scaledFont(size: 14, context: .list)
+                        .foregroundStyle(theme.textPrimary)
+                        .lineLimit(1)
+
+                    Spacer()
+
+                    if folder.readonly {
+                        Image(systemName: "eye")
+                            .scaledFont(size: 10, context: .list)
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                }
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, 7)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            // Expanded chats list
+            if folder.isExpanded {
+                if folder.chats.isEmpty {
+                    Text("No chats")
+                        .scaledFont(size: 13, context: .list)
+                        .foregroundStyle(theme.textTertiary)
+                        .padding(.horizontal, Spacing.md + 20)
+                        .padding(.vertical, 4)
+                } else {
+                    ForEach(folder.chats) { chat in
+                        Button {
+                            activeConversationId = chat.id
+                            activeFolderWorkspaceId = nil
+                            SharedDataService.shared.saveLastActiveConversationId(chat.id)
+                            closeDrawer()
+                        } label: {
+                            HStack {
+                                Text(chat.title)
+                                    .scaledFont(size: 13, context: .list)
+                                    .fontWeight(activeConversationId == chat.id ? .semibold : .regular)
+                                    .foregroundStyle(
+                                        activeConversationId == chat.id ? theme.textPrimary : theme.textSecondary
+                                    )
+                                    .lineLimit(1)
+                                Spacer()
+                                if folder.readonly {
+                                    Image(systemName: "lock.fill")
+                                        .scaledFont(size: 9, context: .list)
+                                        .foregroundStyle(theme.textTertiary)
+                                }
+                            }
+                            .padding(.leading, Spacing.md + 20)
+                            .padding(.trailing, Spacing.md)
+                            .padding(.vertical, 6)
+                            .background(
+                                activeConversationId == chat.id
+                                    ? theme.brandPrimary.opacity(0.08)
+                                    : Color.clear
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Drawer Sub-Section Header (for LazyVStack chat groups)
@@ -2072,14 +2694,21 @@ struct MainChatView: View {
             closeDrawer()
         } label: {
             HStack(spacing: 6) {
-                // DM: show participant avatar; others: show icon
+                // DM: show participant avatar with online dot; others: show icon
                 if channel.type == .dm, let participant = channel.dmParticipants.first {
-                    UserAvatar(
-                        size: 22,
-                        imageURL: participant.resolveAvatarURL(serverBaseURL: dependencies.apiClient?.baseURL ?? ""),
-                        name: participant.displayName,
-                        authToken: dependencies.apiClient?.network.authToken
-                    )
+                    ZStack(alignment: .bottomTrailing) {
+                        UserAvatar(
+                            size: 22,
+                            imageURL: participant.resolveAvatarURL(serverBaseURL: dependencies.apiClient?.baseURL ?? ""),
+                            name: participant.displayName,
+                            authToken: dependencies.apiClient?.network.authToken
+                        )
+                        Circle()
+                            .fill(participant.isOnline ? Color.green : Color.gray.opacity(0.5))
+                            .frame(width: 7, height: 7)
+                            .overlay(Circle().stroke(theme.background, lineWidth: 1))
+                            .offset(x: 2, y: 2)
+                    }
                 } else {
                     Image(systemName: channel.sidebarIcon)
                         .scaledFont(size: 11, context: .list)
@@ -2175,12 +2804,46 @@ struct MainChatView: View {
                 .buttonStyle(.plain)
             } else {
                 Button {
-                    dependencies.activeChatStore.prewarm(conversationId: conversation.id, using: dependencies)
-                    activeConversationId = conversation.id
-                    activeChannelId = nil  // Clear channel when opening a chat
-                    activeFolderWorkspaceId = nil  // Clear folder highlight when opening a regular chat
-                    SharedDataService.shared.saveLastActiveConversationId(conversation.id)
-                    closeDrawer()
+                    let targetId = conversation.id
+                    guard targetId != activeConversationId else { return }
+
+                    // ① Blur the content pane so the old chat softens out instead of
+                    //   showing raw stale content behind the closing drawer.
+                    //   We keep activeConversationId unchanged here — the blur hides
+                    //   the old chat visually while the drawer spring runs.
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        contentTransitionBlur = 10
+                    }
+
+                    // ② Close the drawer and fire haptics so the spring owns the
+                    //   frame with zero contention.
+                    pendingNavigationId = targetId
+                    closeDrawerAnimated()
+                    Haptics.play(.light)
+
+                    // ③ Defer the heavy work (ChatViewModel.configure + view-tree
+                    //   rebuild for ChatDetailView) until after the spring is
+                    //   well underway (~0.26 s ≈ response: 0.32 × 0.8).
+                    //   We capture targetId and guard against a superseding tap
+                    //   so a second tap before the delay expires wins cleanly.
+                    //   The blur then fades out as the new chat renders in — a
+                    //   smooth frosted-glass reveal instead of a hard swap.
+                    let deps = dependencies
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .seconds(0.26))
+                        guard pendingNavigationId == targetId else {
+                            withAnimation(.easeIn(duration: 0.2)) { contentTransitionBlur = 0 }
+                            return
+                        }
+                        deps.activeChatStore.prewarm(conversationId: targetId, using: deps)
+                        activeConversationId = targetId
+                        activeChannelId = nil
+                        activeFolderWorkspaceId = nil
+                        SharedDataService.shared.saveLastActiveConversationId(targetId)
+                        pendingNavigationId = nil
+                        // Fade blur out — the new chat renders in behind the clearing fog
+                        withAnimation(.easeIn(duration: 0.22)) { contentTransitionBlur = 0 }
+                    }
                 } label: {
                     HStack {
                         Text(conversation.title)
@@ -2438,7 +3101,8 @@ struct MainChatView: View {
                                 return URL(string: "\(baseURL)/api/v1/users/\(userId)/profile/image?v=\(v)")
                             }(),
                             name: dependencies.authViewModel.currentUser?.displayName ?? "User",
-                            authToken: dependencies.apiClient?.network.authToken
+                            authToken: dependencies.apiClient?.network.authToken,
+                            dataURIString: dependencies.authViewModel.currentUser?.profileImageURL
                         )
 
                     }

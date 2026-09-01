@@ -16,6 +16,14 @@ final class NetworkManager: NSObject, Sendable {
         keychain.getToken(forServer: serverConfig.url)
     }
 
+    /// Callback fired once when a 401 response is received, so the app can
+    /// immediately route to the sign-in screen without waiting for the next
+    /// API call to fail. Guarded by a one-shot flag so it fires at most once
+    /// per session (avoids multiple parallel requests all triggering logout).
+    private let _tokenExpiredLock = NSLock()
+    private var _tokenExpiredFired = false
+    var onTokenExpired: (() -> Void)?
+
     // MARK: - Initialisation
 
     init(serverConfig: ServerConfig, keychain: KeychainService = .shared) {
@@ -25,7 +33,23 @@ final class NetworkManager: NSObject, Sendable {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 30
         configuration.timeoutIntervalForResource = 300
-        configuration.waitsForConnectivity = true
+        // Do NOT set waitsForConnectivity = true here.
+        // When true, iOS silently suppresses timeoutIntervalForRequest whenever the
+        // network path is momentarily "unsatisfied" (which happens briefly after a
+        // burst of login traffic as the radio settles). This causes all API calls —
+        // getBackendConfig, getCurrentUser, loadModels, etc. — to hang indefinitely
+        // rather than failing fast and allowing the connection monitor to recover.
+        // Per-request timeouts (used by checkHealthFast and health checks) bypass this
+        // behaviour, but regular API calls have no such override and will stall forever.
+        // Removing this flag restores the expected 30s timeout behaviour on all calls.
+
+        // Limit per-host connections to 4 (iOS default is 6 for HTTP/1.1).
+        // Reserving 2 slots for health-check requests and SSE streams prevents the
+        // startup request burst from exhausting the connection pool, which on
+        // high-latency LAN paths (e.g. Docker/Gluetun network namespaces) caused
+        // FIN_WAIT1 socket accumulation and made both the app and Safari temporarily
+        // unable to reach the OpenWebUI origin for ~2 minutes after launch.
+        configuration.httpMaximumConnectionsPerHost = 4
 
         // Disable URLSession HTTP caching — the app is API-driven with its own
         // ImageCacheService, and the default URLCache causes unbounded disk growth.
@@ -191,7 +215,7 @@ final class NetworkManager: NSObject, Sendable {
             timeout: timeout
         )
 
-        let (data, response) = try await performRequest(urlRequest)
+        let (data, response) = try await performRequestWithRetry(urlRequest, maxRetries: 2)
         try validateHTTPResponse(response, data: data)
 
         do {
@@ -223,7 +247,43 @@ final class NetworkManager: NSObject, Sendable {
             timeout: timeout
         )
 
-        let (data, response) = try await performRequest(urlRequest)
+        // Use the deduplicator for bodyless GET requests to prevent duplicate
+        // in-flight requests from multiple startup code paths exhausting the
+        // iOS per-host TCP connection pool.
+        let (data, response): (Data, URLResponse)
+        if method == .get && body == nil {
+            (data, response) = try await deduplicatedGET(urlRequest)
+        } else {
+            (data, response) = try await performRequest(urlRequest)
+        }
+        try validateHTTPResponse(response, data: data)
+        return (data, response as! HTTPURLResponse)
+    }
+
+    /// Downloads any absolute URL belonging to this server using the stored auth token.
+    ///
+    /// Used for server-generated file links that don't follow the `/api/v1/files/{id}/content`
+    /// pattern — e.g. `/cache/files/...`, `/uploads/...`, `/static/...`.
+    /// The auth token is injected so protected endpoints respond correctly.
+    func requestRawAbsoluteURL(
+        _ url: URL,
+        method: HTTPMethod = .get,
+        timeout: TimeInterval? = nil
+    ) async throws -> (Data, HTTPURLResponse) {
+        var request = URLRequest(url: url)
+        request.httpMethod = method.rawValue
+        if let timeout { request.timeoutInterval = timeout }
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let token = authToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        for (key, value) in serverConfig.customHeaders {
+            let lower = key.lowercased()
+            if lower != "authorization" && lower != "content-type" && lower != "accept" {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+        }
+        let (data, response) = try await performRequest(request)
         try validateHTTPResponse(response, data: data)
         return (data, response as! HTTPURLResponse)
     }
@@ -250,7 +310,7 @@ final class NetworkManager: NSObject, Sendable {
             authenticated: authenticated
         )
 
-        let (data, response) = try await performRequest(urlRequest)
+        let (data, response) = try await performRequestWithRetry(urlRequest, maxRetries: 2)
         try validateHTTPResponse(response, data: data)
     }
 
@@ -276,7 +336,7 @@ final class NetworkManager: NSObject, Sendable {
             authenticated: authenticated
         )
 
-        let (data, response) = try await performRequest(urlRequest)
+        let (data, response) = try await performRequestWithRetry(urlRequest, maxRetries: 2)
         try validateHTTPResponse(response, data: data)
     }
 
@@ -304,7 +364,7 @@ final class NetworkManager: NSObject, Sendable {
             timeout: timeout
         )
 
-        let (data, response) = try await performRequest(urlRequest)
+        let (data, response) = try await performRequestWithRetry(urlRequest, maxRetries: 2)
         try validateHTTPResponse(response, data: data)
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -348,7 +408,7 @@ final class NetworkManager: NSObject, Sendable {
             timeout: timeout
         )
 
-        let (data, response) = try await performRequest(urlRequest)
+        let (data, response) = try await performRequestWithRetry(urlRequest, maxRetries: 2)
         try validateHTTPResponse(response, data: data)
 
         // Tolerate null / array / empty body — return empty dict rather than throwing.
@@ -382,7 +442,7 @@ final class NetworkManager: NSObject, Sendable {
             timeout: timeout
         )
 
-        let (data, response) = try await performRequest(urlRequest)
+        let (data, response) = try await performRequestWithRetry(urlRequest, maxRetries: 2)
         try validateHTTPResponse(response, data: data)
 
         guard let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
@@ -440,6 +500,19 @@ final class NetworkManager: NSObject, Sendable {
         return SSEStream(bytes: bytes)
     }
 
+    /// Invalidates and clears the cached streaming session.
+    /// Call this when the server config changes (e.g. user switches servers) so the
+    /// next SSE request creates a fresh session pointed at the correct server with
+    /// the current auth token, rather than reusing a stale session from a prior server.
+    func invalidateStreamingSession() {
+        _streamingSessionLock.lock()
+        let old = _streamingSessionBacking
+        _streamingSessionBacking = nil
+        _streamingSessionLock.unlock()
+        old?.invalidateAndCancel()
+        logger.info("Streaming URLSession invalidated for server switch")
+    }
+
     /// Lock-protected lazy streaming session. Reused across all SSE requests to prevent leaks.
     private let _streamingSessionLock = NSLock()
     private var _streamingSessionBacking: URLSession?
@@ -450,8 +523,15 @@ final class NetworkManager: NSObject, Sendable {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 600
         config.timeoutIntervalForResource = 1200
-        config.waitsForConnectivity = true
+        // Do NOT set waitsForConnectivity = true — same reasoning as the main
+        // session above. When true, iOS silently suppresses the request timeout
+        // whenever NWPathMonitor reports the network path as "unsatisfied", which
+        // happens routinely for LAN-only servers (no internet gateway) even though
+        // the server is perfectly reachable. This caused SSE fallback requests to
+        // hang forever instead of failing fast and letting the retry/recovery
+        // logic take over.
         config.urlCache = nil
+
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         // Allow cookie jar so cf_clearance is auto-sent (same as main session above)
         config.httpCookieStorage = HTTPCookieStorage.shared
@@ -538,6 +618,43 @@ final class NetworkManager: NSObject, Sendable {
         return json
     }
 
+    // MARK: - GET Request Deduplicator
+
+    /// In-flight GET request tasks keyed by URL string.
+    /// Prevents the startup burst from making identical parallel GET requests
+    /// (e.g. `/api/models`, `/api/v1/chats/`, `/api/v1/folders/` each called
+    /// from multiple code paths simultaneously) which exhausted the iOS per-host
+    /// TCP connection pool on high-latency LAN paths (Docker/Gluetun namespaces).
+    ///
+    /// Only GET requests with no body are deduplicated — mutating requests are
+    /// always sent independently.
+    private let deduplicator = GETDeduplicator()
+
+    /// Performs a GET request, coalescing identical in-flight requests.
+    /// If a GET to the same URL is already in progress, waits for that result
+    /// instead of opening a new connection. Cleans up automatically on completion.
+    func deduplicatedGET(_ urlRequest: URLRequest) async throws -> (Data, URLResponse) {
+        guard urlRequest.httpMethod == "GET" || urlRequest.httpMethod == nil,
+              let key = urlRequest.url?.absoluteString
+        else {
+            // Non-GET or no URL — perform directly
+            return try await performRequest(urlRequest)
+        }
+
+        // Check for an existing in-flight task (actor-isolated, async-safe)
+        if let existing = await deduplicator.existing(for: key) {
+            return try await existing.value
+        }
+
+        let task = Task<(Data, URLResponse), Error> { [weak self] in
+            guard let self else { throw APIError.unknown(underlying: nil) }
+            defer { Task { await self.deduplicator.remove(key) } }
+            return try await self.performRequest(urlRequest)
+        }
+        await deduplicator.register(task, for: key)
+        return try await task.value
+    }
+
     // MARK: - Auth Token Management
 
     @discardableResult
@@ -613,7 +730,20 @@ final class NetworkManager: NSObject, Sendable {
         }
 
         guard (200..<400).contains(statusCode) else {
-            throw parseHTTPError(statusCode: statusCode, data: data)
+            let error = parseHTTPError(statusCode: statusCode, data: data)
+            // Fire the 401 auto-sign-out callback once per session so the app
+            // immediately routes to sign-in instead of silently failing.
+            if statusCode == 401 {
+                _tokenExpiredLock.lock()
+                let alreadyFired = _tokenExpiredFired
+                if !alreadyFired { _tokenExpiredFired = true }
+                _tokenExpiredLock.unlock()
+                if !alreadyFired {
+                    let cb = onTokenExpired
+                    DispatchQueue.main.async { cb?() }
+                }
+            }
+            throw error
         }
     }
 
@@ -644,6 +774,26 @@ enum HTTPMethod: String, Sendable {
     case put = "PUT"
     case patch = "PATCH"
     case delete = "DELETE"
+}
+
+// MARK: - GET Deduplicator
+
+/// Actor-isolated store for in-flight GET tasks.
+/// Replaces the old NSLock-based approach which was unavailable in async contexts (Swift 6).
+actor GETDeduplicator {
+    private var inFlight: [String: Task<(Data, URLResponse), Error>] = [:]
+
+    func existing(for key: String) -> Task<(Data, URLResponse), Error>? {
+        inFlight[key]
+    }
+
+    func register(_ task: Task<(Data, URLResponse), Error>, for key: String) {
+        inFlight[key] = task
+    }
+
+    func remove(_ key: String) {
+        inFlight.removeValue(forKey: key)
+    }
 }
 
 // MARK: - Certificate Trust Delegate

@@ -93,6 +93,32 @@ final class StreamingContentStore {
         Task { await p.begin() }
     }
 
+    /// Starts a streaming session for a **continue** response.
+    ///
+    /// Pre-seeds the pipeline buffer with `existingContent` and sets the drain
+    /// cursor to `existingContent.count` so the typewriter starts at the END of the
+    /// already-displayed content. Only new tokens the server appends will trickle in —
+    /// the old content is never re-streamed.
+    func beginStreamingForContinue(messageId: String, modelId: String?, existingContent: String) {
+        streamingMessageId = messageId
+        streamingModelId = modelId
+        resetSnapshotFields()
+        // Pre-seed displayContent so there's no flash of empty content.
+        displayContent = existingContent
+        streamingStatusHistory = []
+        streamingSources = []
+        streamingError = nil
+        isActive = true
+        rawServerContent = existingContent
+
+        let p = StreamingPipeline { [weak self] snapshot in
+            guard let self else { return }
+            self.applySnapshot(snapshot)
+        }
+        pipeline = p
+        Task { await p.beginWithPrefix(existingContent) }
+    }
+
     /// Updates the raw server content (called per token batch).
     func updateContent(_ content: String) {
         rawServerContent = content
@@ -136,6 +162,10 @@ final class StreamingContentStore {
     var drainCompletion: (@MainActor () -> Void)?
 
     /// Ends the streaming session gracefully.
+    ///
+    /// Uses `setFinalContent` to atomically update the buffer AND mark finishing
+    /// in a single actor call — preventing the race where a separate `finish()` Task
+    /// could run before the `append()` Task and cause the final content to be dropped.
     @discardableResult
     func endStreaming(onDrained: (@MainActor () -> Void)? = nil) -> StreamingResult {
         let result = StreamingResult(
@@ -147,7 +177,8 @@ final class StreamingContentStore {
         )
         drainCompletion = onDrained
         let p = pipeline
-        Task { await p?.finish() }
+        let finalContent = rawServerContent
+        Task { await p?.setFinalContent(finalContent) }
         return result
     }
 

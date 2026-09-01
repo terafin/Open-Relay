@@ -27,6 +27,16 @@ final class ModelManager {
         error = nil
         do {
             models = try await apiClient.listWorkspaceModels()
+            // Evict all model avatar URLs from the cache so that any avatar
+            // changed on the server is re-fetched on the next render instead
+            // of serving the stale cached image indefinitely.
+            let baseURL = apiClient.baseURL
+            let avatarURLs = models.compactMap { $0.resolveAvatarURL(baseURL: baseURL) }
+            Task {
+                for url in avatarURLs {
+                    await ImageCacheService.shared.evict(for: url)
+                }
+            }
         } catch {
             self.error = error.localizedDescription
         }
@@ -61,6 +71,11 @@ final class ModelManager {
         }
         if let idx = models.firstIndex(where: { $0.id == detail.id }) {
             models[idx] = updated.toModelItem()
+        }
+        // Evict this model's avatar from the cache so the updated image
+        // is re-fetched immediately on next display.
+        if let url = updated.toModelItem().resolveAvatarURL(baseURL: apiClient.baseURL) {
+            Task { await ImageCacheService.shared.evict(for: url) }
         }
         return updated
     }

@@ -106,6 +106,38 @@ final class SharedChatsViewModel {
         }
     }
 
+    // MARK: - Unshare All
+
+    /// Revokes all share links in one server call, then clears the list.
+    var isUnshareAllInProgress = false
+    var confirmUnshareAll = false
+
+    func unshareAll() {
+        guard !isUnshareAllInProgress else { return }
+        confirmUnshareAll = false
+        isUnshareAllInProgress = true
+        let snapshot = conversations
+        withAnimation(.easeInOut(duration: 0.25)) {
+            conversations = []
+        }
+        Task {
+            do {
+                try await apiClient?.unshareAllConversations()
+                Haptics.notify(.success)
+                showTemporaryToast("All share links revoked")
+                NotificationCenter.default.post(name: .conversationListNeedsRefresh, object: nil)
+            } catch {
+                // Rollback on failure
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    conversations = snapshot
+                }
+                Haptics.notify(.error)
+                showTemporaryToast("Failed to revoke all links")
+            }
+            isUnshareAllInProgress = false
+        }
+    }
+
     // MARK: - Unshare (Revoke)
 
     /// Optimistically revokes the share link — removes from list, calls API, reverts on failure.

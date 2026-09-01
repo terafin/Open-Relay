@@ -40,8 +40,13 @@ import SwiftUI
 struct AnimatedPresence<Content: View>: View {
     /// Whether the content should be visible (full height) or hidden (zero height).
     var visible: Bool
-    /// The animation used to interpolate the height. Defaults to a quick ease-in-out.
-    var animation: Animation = .easeInOut(duration: 0.22)
+    /// The animation used to interpolate the height. Defaults to a soft spring that
+    /// feels more natural than a linear easeInOut (springs don't have a sharp stop).
+    var animation: Animation = .spring(response: 0.35, dampingFraction: 0.85)
+    /// When true, skips the height/opacity animation and snaps instantly.
+    /// Pass `true` during active streaming to prevent blank-frame flashes from
+    /// AnimatedPresence height interpolation fighting the 60Hz drain layout cycle.
+    var skipAnimation: Bool = false
     @ViewBuilder var content: () -> Content
 
     /// The measured natural height of the content.
@@ -63,7 +68,8 @@ struct AnimatedPresence<Content: View>: View {
             .clipped()
             // Fade in/out alongside the height change.
             .opacity(visible ? 1 : 0)
-            // Animate both frame and opacity together.
-            .animation(animation, value: visible)
+            // Animate both frame and opacity together — unless skipAnimation is set
+            // (e.g. during active streaming) to avoid blank-frame height flashes.
+            .animation(skipAnimation ? nil : animation, value: visible)
     }
 }

@@ -4,6 +4,10 @@ import SwiftUI
 
 struct CreateAutomationSheet: View {
     @Bindable var vm: AutomationsViewModel
+    /// When non-nil the sheet opens pre-filled (Clone flow). The caller is
+    /// responsible for clearing this after the sheet dismisses.
+    var prefill: Automation?
+
     @Environment(AppDependencyContainer.self) private var dependencies
     @Environment(\.dismiss) private var dismiss
 
@@ -99,8 +103,10 @@ struct CreateAutomationSheet: View {
             }
         }
         .task {
-            if selectedModelId.isEmpty,
-               let currentId = dependencies.activeChatStore.cachedSelectedModelId {
+            if let source = prefill {
+                applyPrefill(source)
+            } else if selectedModelId.isEmpty,
+                      let currentId = dependencies.activeChatStore.cachedSelectedModelId {
                 selectedModelId = currentId
             }
         }
@@ -334,6 +340,49 @@ struct CreateAutomationSheet: View {
         .background(theme.surfaceContainer)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .padding(.horizontal, 16)
+    }
+
+    // MARK: - Prefill (Clone)
+
+    private func applyPrefill(_ source: Automation) {
+        name = "\(source.name) (Copy)"
+        prompt = source.data.prompt
+        selectedModelId = source.data.modelId
+
+        let rrule = source.data.rrule
+        let schedule = AutomationSchedule.fromRRule(rrule)
+        selectedSchedule = schedule
+
+        switch schedule {
+        case .once:
+            // If the DTSTART is in the past (or missing), default to now + 1 hour
+            // so the user starts from a valid future time.
+            let extracted = AutomationSchedule.extractDTSTARTDate(rrule)
+            let baseDate = extracted.map { $0 < Date() ? Date().addingTimeInterval(3600) : $0 } ?? Date().addingTimeInterval(3600)
+            scheduleDate = baseDate
+
+        case .hourly:
+            let minute = AutomationSchedule.extractMinute(rrule)
+            scheduleTime = Calendar.current.date(from: DateComponents(
+                hour: Calendar.current.component(.hour, from: scheduleTime),
+                minute: minute
+            )) ?? scheduleTime
+
+        case .daily, .weekly, .monthly:
+            let hour = AutomationSchedule.extractHour(rrule)
+            let minute = AutomationSchedule.extractMinute(rrule)
+            scheduleTime = Calendar.current.date(from: DateComponents(hour: hour, minute: minute)) ?? scheduleTime
+            if schedule == .weekly {
+                selectedWeekdays = AutomationSchedule.extractWeekdays(rrule)
+            }
+            if schedule == .monthly {
+                scheduleMonthDay = AutomationSchedule.extractMonthDay(rrule)
+            }
+
+        case .custom:
+            // Strip off any leading "RRULE:" prefix for the text field
+            customRRule = rrule
+        }
     }
 
     // MARK: - Create

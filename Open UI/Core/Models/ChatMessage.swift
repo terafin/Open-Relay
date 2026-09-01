@@ -1,5 +1,76 @@
 import Foundation
 
+// MARK: - MessageAnnotation
+
+/// Feedback annotation stored on a message node, mirroring the server's `annotation` field.
+/// Written after the user rates a response via the 👍 / 👎 action bar buttons.
+struct MessageAnnotation: Codable, Hashable, Sendable {
+    /// Thumbs vote: 1 = positive, -1 = negative.
+    var rating: Int?
+    /// Tags selected or generated for this feedback (e.g. ["Technology", "General"]).
+    var tags: [String]
+    /// One of the pre-defined reason keys (e.g. "accurate_information").
+    var reason: String?
+    /// Free-text comment from the user.
+    var comment: String?
+    /// The numeric 1–10 detail rating inside a nested `details` object.
+    var detailRating: Int?
+
+    init(rating: Int? = nil, tags: [String] = [], reason: String? = nil,
+         comment: String? = nil, detailRating: Int? = nil) {
+        self.rating = rating
+        self.tags = tags
+        self.reason = reason
+        self.comment = comment
+        self.detailRating = detailRating
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case rating, tags, reason, comment, details
+    }
+
+    private enum DetailsCodingKeys: String, CodingKey {
+        case rating
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        rating = try? c.decodeIfPresent(Int.self, forKey: .rating)
+        tags = (try? c.decode([String].self, forKey: .tags)) ?? []
+        reason = try? c.decodeIfPresent(String.self, forKey: .reason)
+        comment = try? c.decodeIfPresent(String.self, forKey: .comment)
+        if let dc = try? c.nestedContainer(keyedBy: DetailsCodingKeys.self, forKey: .details) {
+            detailRating = try? dc.decodeIfPresent(Int.self, forKey: .rating)
+        } else {
+            detailRating = nil
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(rating, forKey: .rating)
+        try c.encode(tags, forKey: .tags)
+        try c.encodeIfPresent(reason, forKey: .reason)
+        try c.encodeIfPresent(comment, forKey: .comment)
+        if let dr = detailRating {
+            var dc = c.nestedContainer(keyedBy: DetailsCodingKeys.self, forKey: .details)
+            try dc.encode(dr, forKey: .rating)
+        }
+    }
+
+    /// Serializes to a `[String: Any]` dict for inclusion in `HistoryNode.toServerDict()`.
+    func toDict() -> [String: Any] {
+        var d: [String: Any] = [
+            "tags": tags
+        ]
+        if let rating { d["rating"] = rating }
+        if let reason { d["reason"] = reason }
+        if let comment { d["comment"] = comment }
+        if let dr = detailRating { d["details"] = ["rating": dr] }
+        return d
+    }
+}
+
 /// The role of a chat message sender.
 enum MessageRole: String, Codable, Sendable {
     case user
@@ -169,6 +240,15 @@ struct ChatMessage: Identifiable, Hashable, Sendable {
     /// message object itself. The iOS app renders these via `RichUIEmbedView`
     /// (the same WKWebView path used for tool-level embeds).
     var embeds: [String]
+    /// Feedback annotation written after the user rates this response.
+    var annotation: MessageAnnotation?
+    /// Server-assigned feedback record ID, used to update the rating details.
+    var feedbackId: String?
+    /// True when this is an internal message (e.g. a background sub-agent completion notice).
+    /// Internal messages are rendered as compact banners instead of full user bubbles.
+    var isInternalMessage: Bool
+    /// The delegation ID of the sub-agent that produced this internal message (if any).
+    var subagentDelegationId: String?
 
     init(
         id: String = UUID().uuidString,
@@ -187,7 +267,11 @@ struct ChatMessage: Identifiable, Hashable, Sendable {
         error: ChatMessageError? = nil,
         versions: [ChatMessageVersion] = [],
         usage: [String: Any]? = nil,
-        embeds: [String] = []
+        embeds: [String] = [],
+        annotation: MessageAnnotation? = nil,
+        feedbackId: String? = nil,
+        isInternalMessage: Bool = false,
+        subagentDelegationId: String? = nil
     ) {
         self.id = id
         self.parentId = parentId
@@ -206,6 +290,10 @@ struct ChatMessage: Identifiable, Hashable, Sendable {
         self.versions = versions
         self.usage = usage
         self.embeds = embeds
+        self.annotation = annotation
+        self.feedbackId = feedbackId
+        self.isInternalMessage = isInternalMessage
+        self.subagentDelegationId = subagentDelegationId
     }
 
     /// O(1) equality check — uses `content.utf8.count` instead of full string
@@ -269,6 +357,12 @@ extension ChatMessage: Codable {
         }
         // embeds are not persisted — they come from the server JSON on each load.
         embeds = []
+        // These fields are runtime-only / not persisted via Codable.
+        parentId = nil
+        annotation = nil
+        feedbackId = nil
+        isInternalMessage = false
+        subagentDelegationId = nil
     }
 
     func encode(to encoder: Encoder) throws {

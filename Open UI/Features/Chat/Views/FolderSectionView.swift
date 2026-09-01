@@ -180,10 +180,16 @@ struct FolderRow: View {
                     .animation(.easeInOut(duration: AnimDuration.fast), value: folder.isExpanded)
                     .frame(width: 16)
 
-                // Folder icon + name
-                Image(systemName: folder.isExpanded ? "folder.fill" : "folder")
-                    .scaledFont(size: 15)
-                    .foregroundStyle(theme.brandPrimary)
+                // Folder icon + name — show emoji if set, else default SF Symbol
+                if let icon = folder.meta?.icon, !icon.isEmpty {
+                    Text(icon)
+                        .scaledFont(size: 16)
+                        .frame(width: 20, height: 20)
+                } else {
+                    Image(systemName: folder.isExpanded ? "folder.fill" : "folder")
+                        .scaledFont(size: 15)
+                        .foregroundStyle(theme.brandPrimary)
+                }
 
                 Text(folder.name)
                     .scaledFont(size: 16)
@@ -217,7 +223,9 @@ struct FolderRow: View {
 
     @ViewBuilder
     private var expandedContent: some View {
-        if folder.chats.isEmpty {
+        // Exclude pinned chats — they're shown in the Pinned section above the folder list.
+        let visibleChats = folder.chats.filter { !folderVM.pinnedChatIds.contains($0.id) }
+        if visibleChats.isEmpty {
             HStack {
                 Spacer()
                 Text("No chats in this folder")
@@ -231,7 +239,7 @@ struct FolderRow: View {
             // Fixed height per row keeps total size predictable without off-screen measurement.
             // Row height: 8pt top padding + 20pt title + 16pt timestamp/accent line + 8pt bottom ≈ 52pt
             LazyVStack(spacing: 0) {
-                ForEach(folder.chats) { chat in
+                ForEach(visibleChats) { chat in
                     FolderChatRow(
                         conversation: chat,
                         folder: folder,
@@ -249,7 +257,9 @@ struct FolderRow: View {
                 }
             }
             .padding(.leading, Spacing.lg + Spacing.sm) // Indent under folder
-            .transition(.opacity.combined(with: .move(edge: .top)))
+            // Single animation source: AnimatedPresence handles height interpolation.
+            // The inner .move transition was a redundant second animation on the same
+            // expand gesture, causing occasional janky expansion on folders with many rows.
         }
     }
 }

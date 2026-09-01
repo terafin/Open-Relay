@@ -113,6 +113,10 @@ struct BackendConfig: Codable, Sendable {
         let enableCodeExecution: Bool?
         let enableCodeInterpreter: Bool?
         let enableWebsocket: Bool?
+        let enableMessageRating: Bool?
+        /// Whether the server has tool-approval (human-in-the-loop) permissions enabled.
+        /// Maps to `chat.tool_permissions.enable` in the server config.
+        let enableToolPermissions: Bool?
 
         // Backward compat aliases
         var authTrustedHeaderAuth: Bool? { authTrustedHeader }
@@ -138,6 +142,8 @@ struct BackendConfig: Codable, Sendable {
             case enableCodeExecution = "enable_code_execution"
             case enableCodeInterpreter = "enable_code_interpreter"
             case enableWebsocket = "enable_websocket"
+            case enableMessageRating = "enable_message_rating"
+            case enableToolPermissions = "enable_tool_permissions"
         }
 
         init(from decoder: Decoder) throws {
@@ -160,6 +166,8 @@ struct BackendConfig: Codable, Sendable {
             enableCodeExecution = try container.decodeIfPresent(Bool.self, forKey: .enableCodeExecution)
             enableCodeInterpreter = try container.decodeIfPresent(Bool.self, forKey: .enableCodeInterpreter)
             enableWebsocket = try container.decodeIfPresent(Bool.self, forKey: .enableWebsocket)
+            enableMessageRating = try container.decodeIfPresent(Bool.self, forKey: .enableMessageRating)
+            enableToolPermissions = try container.decodeIfPresent(Bool.self, forKey: .enableToolPermissions)
         }
     }
 
@@ -278,6 +286,16 @@ struct ChatCompletionRequest: Sendable {
     /// when the chat is re-opened. Matches the web client's `user_message` field.
     var userMessage: [String: Any]?
 
+    /// When set, signals the server to **append** new tokens to the existing assistant
+    /// message rather than starting fresh. Mirrors OpenWebUI's `continueResponse: true`
+    /// flag which adds `assistant_message_id` to the request payload. The server uses
+    /// this to prefix all new output with the existing message content.
+    var assistantMessageId: String?
+    /// The folder ID for the chat. Sent when chatting inside a folder so the
+    /// server tags the chat correctly, emits sidebar events with the right
+    /// folder_id, and applies folder-level knowledge/system prompts server-side.
+    var folderId: String?
+
     struct ChatFeatures: Sendable {
         var webSearch: Bool = false
         var imageGeneration: Bool = false
@@ -348,6 +366,16 @@ struct ChatCompletionRequest: Sendable {
         // the user message node into the chat's history tree. Without this field
         // the server doesn't link the user message and it disappears on re-open.
         if let userMessage { data["user_message"] = userMessage }
+
+        // assistant_message_id: signals the server to append new tokens to the
+        // existing assistant message rather than starting fresh. Mirrors OpenWebUI's
+        // continueResponse flag. Only sent when set (i.e. for continue requests).
+        if let assistantMessageId { data["assistant_message_id"] = assistantMessageId }
+
+        // folder_id: send when chatting inside a folder so the server tags the chat,
+        // emits sidebar events with the correct folder_id, and applies folder-level
+        // knowledge/system prompts server-side — matching OpenWebUI's `folder_id` field.
+        if let folderId, !folderId.isEmpty { data["folder_id"] = folderId }
 
         // Always send all feature keys with explicit true/false values,
         // matching the web client behavior. If we only send `true` keys
@@ -475,6 +503,42 @@ struct FolderResponse: Codable, Sendable {
     }
 }
 
+// MARK: - Model Switch Status
+
+/// Response from an optional model-switch status endpoint
+/// (e.g. `GET http://<host>:8091/v1/switch/status`).
+///
+/// Used by the optional cold-switch progress feature (issue #79).
+/// When the user configures a `switchStatusURL` on a server, Open Relay polls
+/// this endpoint every 1 s while a chat request is pending. If `loadingModel`
+/// is non-nil the banner "Switching to <model>, ~Xs left" is shown.
+struct ModelSwitchStatus: Codable, Sendable {
+    let ok: Bool
+    let activeModel: String?
+    /// Non-nil while a model is being loaded; nil when idle.
+    let loadingModel: String?
+    let phase: String?
+    let estimateSeconds: Double?
+    let elapsedSeconds: Double?
+    let remainingSeconds: Double?
+    /// Loading progress 0.0–1.0. Nil when not switching.
+    let progress: Double?
+
+    /// Convenience: `true` iff a model switch is currently in progress.
+    var isSwitching: Bool { loadingModel != nil }
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case activeModel      = "active_model"
+        case loadingModel     = "loading_model"
+        case phase
+        case estimateSeconds  = "estimate_seconds"
+        case elapsedSeconds   = "elapsed_seconds"
+        case remainingSeconds = "remaining_seconds"
+        case progress
+    }
+}
+
 // MARK: - Task Configuration
 
 /// Server-side task configuration from `GET /api/v1/tasks/config`.
@@ -526,11 +590,15 @@ struct TaskConfig: Sendable {
 struct AdminTaskConfig: Codable, Sendable {
     var taskModel: String
     var taskModelExternal: String
+    /// Generation parameters for the task model. Only non-nil values are sent to the server.
+    /// `null` per key = "Default" (absent from dict). Matches web `configuredParams()` stripping.
+    var taskModelParams: [String: Any]
     var enableTitleGeneration: Bool
     var enableFollowUpGeneration: Bool
     var enableTagsGeneration: Bool
     var enableAutocompleteGeneration: Bool
     var autocompleteGenerationInputMaxLength: Int
+    var autocompleteGenerationPromptTemplate: String
     var enableSearchQueryGeneration: Bool
     var enableRetrievalQueryGeneration: Bool
     var titleGenerationPromptTemplate: String
@@ -539,16 +607,19 @@ struct AdminTaskConfig: Codable, Sendable {
     var queryGenerationPromptTemplate: String
     var imagePromptGenerationPromptTemplate: String
     var toolsFunctionCallingPromptTemplate: String
+    var enableVoiceModePrompt: Bool
     var voiceModePromptTemplate: String
 
     enum CodingKeys: String, CodingKey {
         case taskModel = "TASK_MODEL"
         case taskModelExternal = "TASK_MODEL_EXTERNAL"
+        case taskModelParams = "TASK_MODEL_PARAMS"
         case enableTitleGeneration = "ENABLE_TITLE_GENERATION"
         case enableFollowUpGeneration = "ENABLE_FOLLOW_UP_GENERATION"
         case enableTagsGeneration = "ENABLE_TAGS_GENERATION"
         case enableAutocompleteGeneration = "ENABLE_AUTOCOMPLETE_GENERATION"
         case autocompleteGenerationInputMaxLength = "AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH"
+        case autocompleteGenerationPromptTemplate = "AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE"
         case enableSearchQueryGeneration = "ENABLE_SEARCH_QUERY_GENERATION"
         case enableRetrievalQueryGeneration = "ENABLE_RETRIEVAL_QUERY_GENERATION"
         case titleGenerationPromptTemplate = "TITLE_GENERATION_PROMPT_TEMPLATE"
@@ -557,17 +628,20 @@ struct AdminTaskConfig: Codable, Sendable {
         case queryGenerationPromptTemplate = "QUERY_GENERATION_PROMPT_TEMPLATE"
         case imagePromptGenerationPromptTemplate = "IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE"
         case toolsFunctionCallingPromptTemplate = "TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE"
+        case enableVoiceModePrompt = "ENABLE_VOICE_MODE_PROMPT"
         case voiceModePromptTemplate = "VOICE_MODE_PROMPT_TEMPLATE"
     }
 
     init() {
         taskModel = ""
         taskModelExternal = ""
+        taskModelParams = [:]
         enableTitleGeneration = true
         enableFollowUpGeneration = true
         enableTagsGeneration = true
         enableAutocompleteGeneration = false
         autocompleteGenerationInputMaxLength = 256
+        autocompleteGenerationPromptTemplate = ""
         enableSearchQueryGeneration = true
         enableRetrievalQueryGeneration = true
         titleGenerationPromptTemplate = ""
@@ -576,7 +650,67 @@ struct AdminTaskConfig: Codable, Sendable {
         queryGenerationPromptTemplate = ""
         imagePromptGenerationPromptTemplate = ""
         toolsFunctionCallingPromptTemplate = ""
+        enableVoiceModePrompt = true
         voiceModePromptTemplate = ""
+    }
+
+    // Custom decoder: TASK_MODEL_PARAMS can be a JSON dict or null from the server.
+    // Custom decoder: TASK_MODEL_PARAMS arrives as a dict or null from the server.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        taskModel = (try? c.decode(String.self, forKey: .taskModel)) ?? ""
+        taskModelExternal = (try? c.decode(String.self, forKey: .taskModelExternal)) ?? ""
+        // TASK_MODEL_PARAMS arrives as a dict or null — decode directly to [String: Any]
+        if let paramsObj = try? c.decode([String: AnyCodable].self, forKey: .taskModelParams) {
+            taskModelParams = paramsObj.compactMapValues { $0.value }
+        } else {
+            taskModelParams = [:]
+        }
+        enableTitleGeneration = (try? c.decode(Bool.self, forKey: .enableTitleGeneration)) ?? true
+        enableFollowUpGeneration = (try? c.decode(Bool.self, forKey: .enableFollowUpGeneration)) ?? true
+        enableTagsGeneration = (try? c.decode(Bool.self, forKey: .enableTagsGeneration)) ?? true
+        enableAutocompleteGeneration = (try? c.decode(Bool.self, forKey: .enableAutocompleteGeneration)) ?? false
+        autocompleteGenerationInputMaxLength = (try? c.decode(Int.self, forKey: .autocompleteGenerationInputMaxLength)) ?? 256
+        autocompleteGenerationPromptTemplate = (try? c.decode(String.self, forKey: .autocompleteGenerationPromptTemplate)) ?? ""
+        enableSearchQueryGeneration = (try? c.decode(Bool.self, forKey: .enableSearchQueryGeneration)) ?? true
+        enableRetrievalQueryGeneration = (try? c.decode(Bool.self, forKey: .enableRetrievalQueryGeneration)) ?? true
+        titleGenerationPromptTemplate = (try? c.decode(String.self, forKey: .titleGenerationPromptTemplate)) ?? ""
+        followUpGenerationPromptTemplate = (try? c.decode(String.self, forKey: .followUpGenerationPromptTemplate)) ?? ""
+        tagsGenerationPromptTemplate = (try? c.decode(String.self, forKey: .tagsGenerationPromptTemplate)) ?? ""
+        queryGenerationPromptTemplate = (try? c.decode(String.self, forKey: .queryGenerationPromptTemplate)) ?? ""
+        imagePromptGenerationPromptTemplate = (try? c.decode(String.self, forKey: .imagePromptGenerationPromptTemplate)) ?? ""
+        toolsFunctionCallingPromptTemplate = (try? c.decode(String.self, forKey: .toolsFunctionCallingPromptTemplate)) ?? ""
+        enableVoiceModePrompt = (try? c.decode(Bool.self, forKey: .enableVoiceModePrompt)) ?? true
+        voiceModePromptTemplate = (try? c.decode(String.self, forKey: .voiceModePromptTemplate)) ?? ""
+    }
+
+    // Custom encoder: send only non-null values to the server (matches web configuredParams()).
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(taskModel, forKey: .taskModel)
+        try c.encode(taskModelExternal, forKey: .taskModelExternal)
+        // Encode only non-null values — matches web configuredParams() stripping nulls
+        if taskModelParams.isEmpty {
+            try c.encodeNil(forKey: .taskModelParams)
+        } else {
+            try c.encode(taskModelParams.mapValues { AnyCodable($0) }, forKey: .taskModelParams)
+        }
+        try c.encode(enableTitleGeneration, forKey: .enableTitleGeneration)
+        try c.encode(enableFollowUpGeneration, forKey: .enableFollowUpGeneration)
+        try c.encode(enableTagsGeneration, forKey: .enableTagsGeneration)
+        try c.encode(enableAutocompleteGeneration, forKey: .enableAutocompleteGeneration)
+        try c.encode(autocompleteGenerationInputMaxLength, forKey: .autocompleteGenerationInputMaxLength)
+        try c.encode(autocompleteGenerationPromptTemplate, forKey: .autocompleteGenerationPromptTemplate)
+        try c.encode(enableSearchQueryGeneration, forKey: .enableSearchQueryGeneration)
+        try c.encode(enableRetrievalQueryGeneration, forKey: .enableRetrievalQueryGeneration)
+        try c.encode(titleGenerationPromptTemplate, forKey: .titleGenerationPromptTemplate)
+        try c.encode(followUpGenerationPromptTemplate, forKey: .followUpGenerationPromptTemplate)
+        try c.encode(tagsGenerationPromptTemplate, forKey: .tagsGenerationPromptTemplate)
+        try c.encode(queryGenerationPromptTemplate, forKey: .queryGenerationPromptTemplate)
+        try c.encode(imagePromptGenerationPromptTemplate, forKey: .imagePromptGenerationPromptTemplate)
+        try c.encode(toolsFunctionCallingPromptTemplate, forKey: .toolsFunctionCallingPromptTemplate)
+        try c.encode(enableVoiceModePrompt, forKey: .enableVoiceModePrompt)
+        try c.encode(voiceModePromptTemplate, forKey: .voiceModePromptTemplate)
     }
 }
 
@@ -599,11 +733,15 @@ struct AdminAuthConfig: Codable, Sendable {
     var enableFolders: Bool
     var folderMaxFileCount: String
     var enableChannels: Bool
+    /// Controls where model responses to root-level channel mentions are posted ("thread" | "channel").
+    var channelModelResponseMode: String
     var enableCalendar: Bool
     var enableAutomations: Bool
     var automationMaxCount: String
     var automationMinInterval: String
     var enableMemories: Bool
+    /// When true, saved memories are injected into the system context for every request.
+    var enableMemorySystemContext: Bool
     var enableNotes: Bool
     var enableUserWebhooks: Bool
     var enableUserStatus: Bool
@@ -627,11 +765,13 @@ struct AdminAuthConfig: Codable, Sendable {
         case enableFolders                 = "ENABLE_FOLDERS"
         case folderMaxFileCount            = "FOLDER_MAX_FILE_COUNT"
         case enableChannels                = "ENABLE_CHANNELS"
+        case channelModelResponseMode      = "CHANNEL_MODEL_RESPONSE_MODE"
         case enableCalendar                = "ENABLE_CALENDAR"
         case enableAutomations             = "ENABLE_AUTOMATIONS"
         case automationMaxCount            = "AUTOMATION_MAX_COUNT"
         case automationMinInterval         = "AUTOMATION_MIN_INTERVAL"
         case enableMemories                = "ENABLE_MEMORIES"
+        case enableMemorySystemContext     = "ENABLE_MEMORY_SYSTEM_CONTEXT"
         case enableNotes                   = "ENABLE_NOTES"
         case enableUserWebhooks            = "ENABLE_USER_WEBHOOKS"
         case enableUserStatus              = "ENABLE_USER_STATUS"
@@ -659,11 +799,13 @@ struct AdminAuthConfig: Codable, Sendable {
         enableFolders                 = (try? c.decode(Bool.self,   forKey: .enableFolders))                 ?? true
         folderMaxFileCount            = (try? c.decode(String.self, forKey: .folderMaxFileCount))            ?? ""
         enableChannels                = (try? c.decode(Bool.self,   forKey: .enableChannels))                ?? true
+        channelModelResponseMode      = (try? c.decode(String.self, forKey: .channelModelResponseMode))      ?? "thread"
         enableCalendar                = (try? c.decode(Bool.self,   forKey: .enableCalendar))                ?? true
         enableAutomations             = (try? c.decode(Bool.self,   forKey: .enableAutomations))             ?? true
         automationMaxCount            = (try? c.decode(String.self, forKey: .automationMaxCount))            ?? ""
         automationMinInterval         = (try? c.decode(String.self, forKey: .automationMinInterval))         ?? ""
         enableMemories                = (try? c.decode(Bool.self,   forKey: .enableMemories))                ?? true
+        enableMemorySystemContext     = (try? c.decode(Bool.self,   forKey: .enableMemorySystemContext))     ?? true
         enableNotes                   = (try? c.decode(Bool.self,   forKey: .enableNotes))                   ?? true
         enableUserWebhooks            = (try? c.decode(Bool.self,   forKey: .enableUserWebhooks))            ?? true
         enableUserStatus              = (try? c.decode(Bool.self,   forKey: .enableUserStatus))              ?? true
@@ -678,9 +820,11 @@ struct AdminAuthConfig: Codable, Sendable {
         apiKeysAllowedEndpoints: String = "", defaultUserRole: String = "pending", defaultGroupID: String = "",
         jwtExpiresIn: String = "-1", enableCommunitySharing: Bool = false, enableMessageRating: Bool = false,
         enableFolders: Bool = true, folderMaxFileCount: String = "", enableChannels: Bool = true,
+        channelModelResponseMode: String = "thread",
         enableCalendar: Bool = true, enableAutomations: Bool = true,
         automationMaxCount: String = "", automationMinInterval: String = "",
-        enableMemories: Bool = true, enableNotes: Bool = true, enableUserWebhooks: Bool = true,
+        enableMemories: Bool = true, enableMemorySystemContext: Bool = true,
+        enableNotes: Bool = true, enableUserWebhooks: Bool = true,
         enableUserStatus: Bool = true, pendingUserOverlayTitle: String = "", pendingUserOverlayContent: String = "",
         responseWatermark: String = ""
     ) {
@@ -691,10 +835,11 @@ struct AdminAuthConfig: Codable, Sendable {
         self.defaultGroupID = defaultGroupID; self.jwtExpiresIn = jwtExpiresIn
         self.enableCommunitySharing = enableCommunitySharing; self.enableMessageRating = enableMessageRating
         self.enableFolders = enableFolders; self.folderMaxFileCount = folderMaxFileCount
-        self.enableChannels = enableChannels
+        self.enableChannels = enableChannels; self.channelModelResponseMode = channelModelResponseMode
         self.enableCalendar = enableCalendar; self.enableAutomations = enableAutomations
         self.automationMaxCount = automationMaxCount; self.automationMinInterval = automationMinInterval
-        self.enableMemories = enableMemories; self.enableNotes = enableNotes
+        self.enableMemories = enableMemories; self.enableMemorySystemContext = enableMemorySystemContext
+        self.enableNotes = enableNotes
         self.enableUserWebhooks = enableUserWebhooks; self.enableUserStatus = enableUserStatus
         self.pendingUserOverlayTitle = pendingUserOverlayTitle; self.pendingUserOverlayContent = pendingUserOverlayContent
         self.responseWatermark = responseWatermark
@@ -725,6 +870,10 @@ struct AdminLdapServerConfig: Codable, Sendable {
     var certificatePath: String?
     var validateCert: Bool
     var ciphers: String?
+    // Group sync (v0.11.0)
+    var enableGroupManagement: Bool
+    var enableGroupCreation: Bool
+    var attributeForGroups: String
 
     enum CodingKeys: String, CodingKey {
         case label, host, port
@@ -738,23 +887,29 @@ struct AdminLdapServerConfig: Codable, Sendable {
         case certificatePath        = "certificate_path"
         case validateCert           = "validate_cert"
         case ciphers
+        case enableGroupManagement  = "enable_group_management"
+        case enableGroupCreation    = "enable_group_creation"
+        case attributeForGroups     = "attribute_for_groups"
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        label              = (try? c.decode(String.self, forKey: .label))              ?? ""
-        host               = (try? c.decode(String.self, forKey: .host))               ?? ""
-        port               = try? c.decode(Int.self,    forKey: .port)
-        attributeForMail   = (try? c.decode(String.self, forKey: .attributeForMail))   ?? "mail"
-        attributeForUsername = (try? c.decode(String.self, forKey: .attributeForUsername)) ?? "uid"
-        appDN              = (try? c.decode(String.self, forKey: .appDN))              ?? ""
-        appDNPassword      = (try? c.decode(String.self, forKey: .appDNPassword))      ?? ""
-        searchBase         = (try? c.decode(String.self, forKey: .searchBase))         ?? ""
-        searchFilters      = (try? c.decode(String.self, forKey: .searchFilters))      ?? ""
-        useTLS             = (try? c.decode(Bool.self,   forKey: .useTLS))             ?? true
-        certificatePath    = try? c.decode(String.self, forKey: .certificatePath)
-        validateCert       = (try? c.decode(Bool.self,   forKey: .validateCert))       ?? true
-        ciphers            = try? c.decode(String.self, forKey: .ciphers)
+        label                 = (try? c.decode(String.self, forKey: .label))                 ?? ""
+        host                  = (try? c.decode(String.self, forKey: .host))                  ?? ""
+        port                  = try? c.decode(Int.self,    forKey: .port)
+        attributeForMail      = (try? c.decode(String.self, forKey: .attributeForMail))      ?? "mail"
+        attributeForUsername  = (try? c.decode(String.self, forKey: .attributeForUsername))  ?? "uid"
+        appDN                 = (try? c.decode(String.self, forKey: .appDN))                 ?? ""
+        appDNPassword         = (try? c.decode(String.self, forKey: .appDNPassword))         ?? ""
+        searchBase            = (try? c.decode(String.self, forKey: .searchBase))            ?? ""
+        searchFilters         = (try? c.decode(String.self, forKey: .searchFilters))         ?? ""
+        useTLS                = (try? c.decode(Bool.self,   forKey: .useTLS))                ?? true
+        certificatePath       = try? c.decode(String.self, forKey: .certificatePath)
+        validateCert          = (try? c.decode(Bool.self,   forKey: .validateCert))          ?? true
+        ciphers               = try? c.decode(String.self, forKey: .ciphers)
+        enableGroupManagement = (try? c.decode(Bool.self,   forKey: .enableGroupManagement)) ?? false
+        enableGroupCreation   = (try? c.decode(Bool.self,   forKey: .enableGroupCreation))   ?? false
+        attributeForGroups    = (try? c.decode(String.self, forKey: .attributeForGroups))    ?? "memberOf"
     }
 
     init(
@@ -762,13 +917,18 @@ struct AdminLdapServerConfig: Codable, Sendable {
         attributeForMail: String = "mail", attributeForUsername: String = "uid",
         appDN: String = "", appDNPassword: String = "", searchBase: String = "",
         searchFilters: String = "", useTLS: Bool = true, certificatePath: String? = nil,
-        validateCert: Bool = true, ciphers: String? = "ALL"
+        validateCert: Bool = true, ciphers: String? = "ALL",
+        enableGroupManagement: Bool = false, enableGroupCreation: Bool = false,
+        attributeForGroups: String = "memberOf"
     ) {
         self.label = label; self.host = host; self.port = port
         self.attributeForMail = attributeForMail; self.attributeForUsername = attributeForUsername
         self.appDN = appDN; self.appDNPassword = appDNPassword; self.searchBase = searchBase
         self.searchFilters = searchFilters; self.useTLS = useTLS; self.certificatePath = certificatePath
         self.validateCert = validateCert; self.ciphers = ciphers
+        self.enableGroupManagement = enableGroupManagement
+        self.enableGroupCreation = enableGroupCreation
+        self.attributeForGroups = attributeForGroups
     }
 }
 
@@ -807,6 +967,187 @@ struct AdminGroupItem: Codable, Identifiable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, name, description
         case memberCount = "member_count"
+    }
+}
+
+// MARK: - Admin Chat Config (Interface Tab — Context Compaction)
+
+/// Mutable Codable struct for the admin "Interface → Chat" section.
+/// GET `/api/v1/chats/config`  •  POST `/api/v1/chats/config`
+/// Keys are SCREAMING_SNAKE_CASE to match the server JSON.
+struct AdminChatConfig: Codable, Sendable {
+    var enableContextCompaction: Bool
+    var contextCompactionModel: String
+    var contextCompactionTokenThreshold: Int
+    var contextCompactionTokenCap: Int
+    var contextCompactionRetentionPercentage: Int
+    var contextCompactionPromptTemplate: String
+    /// Enables the Tool Permissions (human-in-the-loop) feature for all users.
+    /// Maps to `chat.tool_permissions.enable` on the server.
+    var enableToolPermissions: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case enableContextCompaction           = "ENABLE_CONTEXT_COMPACTION"
+        case contextCompactionModel            = "CONTEXT_COMPACTION_MODEL"
+        case contextCompactionTokenThreshold   = "CONTEXT_COMPACTION_TOKEN_THRESHOLD"
+        case contextCompactionTokenCap         = "CONTEXT_COMPACTION_TOKEN_CAP"
+        case contextCompactionRetentionPercentage = "CONTEXT_COMPACTION_RETENTION_PERCENTAGE"
+        case contextCompactionPromptTemplate   = "CONTEXT_COMPACTION_PROMPT_TEMPLATE"
+        case enableToolPermissions             = "ENABLE_TOOL_PERMISSIONS"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enableContextCompaction           = (try? c.decode(Bool.self,   forKey: .enableContextCompaction))           ?? false
+        contextCompactionModel            = (try? c.decode(String.self, forKey: .contextCompactionModel))            ?? ""
+        contextCompactionTokenThreshold   = (try? c.decode(Int.self,    forKey: .contextCompactionTokenThreshold))   ?? 80000
+        contextCompactionTokenCap         = (try? c.decode(Int.self,    forKey: .contextCompactionTokenCap))         ?? 80000
+        contextCompactionRetentionPercentage = (try? c.decode(Int.self, forKey: .contextCompactionRetentionPercentage)) ?? 40
+        contextCompactionPromptTemplate   = (try? c.decode(String.self, forKey: .contextCompactionPromptTemplate))   ?? ""
+        enableToolPermissions             = (try? c.decode(Bool.self,   forKey: .enableToolPermissions))             ?? false
+    }
+
+    init(
+        enableContextCompaction: Bool = false,
+        contextCompactionModel: String = "",
+        contextCompactionTokenThreshold: Int = 80000,
+        contextCompactionTokenCap: Int = 80000,
+        contextCompactionRetentionPercentage: Int = 40,
+        contextCompactionPromptTemplate: String = "",
+        enableToolPermissions: Bool = false
+    ) {
+        self.enableContextCompaction = enableContextCompaction
+        self.contextCompactionModel = contextCompactionModel
+        self.contextCompactionTokenThreshold = contextCompactionTokenThreshold
+        self.contextCompactionTokenCap = contextCompactionTokenCap
+        self.contextCompactionRetentionPercentage = contextCompactionRetentionPercentage
+        self.contextCompactionPromptTemplate = contextCompactionPromptTemplate
+        self.enableToolPermissions = enableToolPermissions
+    }
+}
+
+// MARK: - Admin OAuth Config (Authentication Tab)
+
+/// Admin OAuth/OIDC configuration — GET/POST `/api/v1/auths/admin/config/oauth`.
+struct AdminOAuthConfig: Codable, Sendable {
+    var enableOAuth: Bool
+    var oauthProviderName: String
+    var openidProviderURL: String
+    var oauthClientId: String
+    var oauthClientSecret: String
+    var openidRedirectURI: String
+    var oauthScopes: String
+    var oauthEmailClaim: String
+    var oauthUsernameClaim: String
+    var oauthPictureClaim: String
+    var oauthSubClaim: String
+    var enableOAuthSignup: Bool
+    var oauthMergeAccountsByEmail: Bool
+    var oauthAutoRedirect: Bool
+    var oauthAllowedDomains: String
+    var enableOAuthRoleManagement: Bool
+    var oauthRolesClaim: String
+    var oauthAdminRoles: String
+    var oauthAllowedRoles: String
+    var enableOAuthGroupManagement: Bool
+    var enableOAuthGroupCreation: Bool
+    var oauthGroupClaim: String
+    var oauthBlockedGroups: String
+    var oauthUpdateEmailOnLogin: Bool
+    var oauthUpdateNameOnLogin: Bool
+    var oauthUpdatePictureOnLogin: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case enableOAuth                = "ENABLE_OAUTH"
+        case oauthProviderName          = "OAUTH_PROVIDER_NAME"
+        case openidProviderURL          = "OPENID_PROVIDER_URL"
+        case oauthClientId              = "OAUTH_CLIENT_ID"
+        case oauthClientSecret          = "OAUTH_CLIENT_SECRET"
+        case openidRedirectURI          = "OPENID_REDIRECT_URI"
+        case oauthScopes                = "OAUTH_SCOPES"
+        case oauthEmailClaim            = "OAUTH_EMAIL_CLAIM"
+        case oauthUsernameClaim         = "OAUTH_USERNAME_CLAIM"
+        case oauthPictureClaim          = "OAUTH_PICTURE_CLAIM"
+        case oauthSubClaim              = "OAUTH_SUB_CLAIM"
+        case enableOAuthSignup          = "ENABLE_OAUTH_SIGNUP"
+        case oauthMergeAccountsByEmail  = "OAUTH_MERGE_ACCOUNTS_BY_EMAIL"
+        case oauthAutoRedirect          = "OAUTH_AUTO_REDIRECT"
+        case oauthAllowedDomains        = "OAUTH_ALLOWED_DOMAINS"
+        case enableOAuthRoleManagement  = "ENABLE_OAUTH_ROLE_MANAGEMENT"
+        case oauthRolesClaim            = "OAUTH_ROLES_CLAIM"
+        case oauthAdminRoles            = "OAUTH_ADMIN_ROLES"
+        case oauthAllowedRoles          = "OAUTH_ALLOWED_ROLES"
+        case enableOAuthGroupManagement = "ENABLE_OAUTH_GROUP_MANAGEMENT"
+        case enableOAuthGroupCreation   = "ENABLE_OAUTH_GROUP_CREATION"
+        case oauthGroupClaim            = "OAUTH_GROUP_CLAIM"
+        case oauthBlockedGroups         = "OAUTH_BLOCKED_GROUPS"
+        case oauthUpdateEmailOnLogin    = "OAUTH_UPDATE_EMAIL_ON_LOGIN"
+        case oauthUpdateNameOnLogin     = "OAUTH_UPDATE_NAME_ON_LOGIN"
+        case oauthUpdatePictureOnLogin  = "OAUTH_UPDATE_PICTURE_ON_LOGIN"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enableOAuth                = (try? c.decode(Bool.self,   forKey: .enableOAuth))                ?? false
+        oauthProviderName          = (try? c.decode(String.self, forKey: .oauthProviderName))          ?? "SSO"
+        openidProviderURL          = (try? c.decode(String.self, forKey: .openidProviderURL))          ?? ""
+        oauthClientId              = (try? c.decode(String.self, forKey: .oauthClientId))              ?? ""
+        oauthClientSecret          = (try? c.decode(String.self, forKey: .oauthClientSecret))          ?? ""
+        openidRedirectURI          = (try? c.decode(String.self, forKey: .openidRedirectURI))          ?? ""
+        oauthScopes                = (try? c.decode(String.self, forKey: .oauthScopes))                ?? "openid email profile"
+        oauthEmailClaim            = (try? c.decode(String.self, forKey: .oauthEmailClaim))            ?? "email"
+        oauthUsernameClaim         = (try? c.decode(String.self, forKey: .oauthUsernameClaim))         ?? "name"
+        oauthPictureClaim          = (try? c.decode(String.self, forKey: .oauthPictureClaim))          ?? "picture"
+        oauthSubClaim              = (try? c.decode(String.self, forKey: .oauthSubClaim))              ?? "sub"
+        enableOAuthSignup          = (try? c.decode(Bool.self,   forKey: .enableOAuthSignup))          ?? true
+        oauthMergeAccountsByEmail  = (try? c.decode(Bool.self,   forKey: .oauthMergeAccountsByEmail))  ?? false
+        oauthAutoRedirect          = (try? c.decode(Bool.self,   forKey: .oauthAutoRedirect))          ?? false
+        oauthAllowedDomains        = (try? c.decode(String.self, forKey: .oauthAllowedDomains))        ?? ""
+        enableOAuthRoleManagement  = (try? c.decode(Bool.self,   forKey: .enableOAuthRoleManagement))  ?? false
+        oauthRolesClaim            = (try? c.decode(String.self, forKey: .oauthRolesClaim))            ?? "roles"
+        oauthAdminRoles            = (try? c.decode(String.self, forKey: .oauthAdminRoles))            ?? "admin"
+        oauthAllowedRoles          = (try? c.decode(String.self, forKey: .oauthAllowedRoles))          ?? "*"
+        enableOAuthGroupManagement = (try? c.decode(Bool.self,   forKey: .enableOAuthGroupManagement)) ?? false
+        enableOAuthGroupCreation   = (try? c.decode(Bool.self,   forKey: .enableOAuthGroupCreation))   ?? false
+        oauthGroupClaim            = (try? c.decode(String.self, forKey: .oauthGroupClaim))            ?? "groups"
+        oauthBlockedGroups         = (try? c.decode(String.self, forKey: .oauthBlockedGroups))         ?? ""
+        oauthUpdateEmailOnLogin    = (try? c.decode(Bool.self,   forKey: .oauthUpdateEmailOnLogin))    ?? false
+        oauthUpdateNameOnLogin     = (try? c.decode(Bool.self,   forKey: .oauthUpdateNameOnLogin))     ?? false
+        oauthUpdatePictureOnLogin  = (try? c.decode(Bool.self,   forKey: .oauthUpdatePictureOnLogin))  ?? false
+    }
+
+    init(
+        enableOAuth: Bool = false, oauthProviderName: String = "SSO",
+        openidProviderURL: String = "", oauthClientId: String = "", oauthClientSecret: String = "",
+        openidRedirectURI: String = "", oauthScopes: String = "openid email profile",
+        oauthEmailClaim: String = "email", oauthUsernameClaim: String = "name",
+        oauthPictureClaim: String = "picture", oauthSubClaim: String = "sub",
+        enableOAuthSignup: Bool = true, oauthMergeAccountsByEmail: Bool = false,
+        oauthAutoRedirect: Bool = false, oauthAllowedDomains: String = "",
+        enableOAuthRoleManagement: Bool = false, oauthRolesClaim: String = "roles",
+        oauthAdminRoles: String = "admin", oauthAllowedRoles: String = "*",
+        enableOAuthGroupManagement: Bool = false, enableOAuthGroupCreation: Bool = false,
+        oauthGroupClaim: String = "groups", oauthBlockedGroups: String = "",
+        oauthUpdateEmailOnLogin: Bool = false, oauthUpdateNameOnLogin: Bool = false,
+        oauthUpdatePictureOnLogin: Bool = false
+    ) {
+        self.enableOAuth = enableOAuth; self.oauthProviderName = oauthProviderName
+        self.openidProviderURL = openidProviderURL; self.oauthClientId = oauthClientId
+        self.oauthClientSecret = oauthClientSecret; self.openidRedirectURI = openidRedirectURI
+        self.oauthScopes = oauthScopes; self.oauthEmailClaim = oauthEmailClaim
+        self.oauthUsernameClaim = oauthUsernameClaim; self.oauthPictureClaim = oauthPictureClaim
+        self.oauthSubClaim = oauthSubClaim; self.enableOAuthSignup = enableOAuthSignup
+        self.oauthMergeAccountsByEmail = oauthMergeAccountsByEmail
+        self.oauthAutoRedirect = oauthAutoRedirect; self.oauthAllowedDomains = oauthAllowedDomains
+        self.enableOAuthRoleManagement = enableOAuthRoleManagement
+        self.oauthRolesClaim = oauthRolesClaim; self.oauthAdminRoles = oauthAdminRoles
+        self.oauthAllowedRoles = oauthAllowedRoles
+        self.enableOAuthGroupManagement = enableOAuthGroupManagement
+        self.enableOAuthGroupCreation = enableOAuthGroupCreation
+        self.oauthGroupClaim = oauthGroupClaim; self.oauthBlockedGroups = oauthBlockedGroups
+        self.oauthUpdateEmailOnLogin = oauthUpdateEmailOnLogin
+        self.oauthUpdateNameOnLogin = oauthUpdateNameOnLogin
+        self.oauthUpdatePictureOnLogin = oauthUpdatePictureOnLogin
     }
 }
 
@@ -1204,19 +1545,23 @@ struct AdminTTSConfig: Codable, Sendable {
     var azureSpeechRegion: String
     var azureSpeechBaseURL: String
     var azureSpeechOutputFormat: String
+    var mistralAPIKey: String
+    var mistralAPIBaseURL: String
 
     enum CodingKeys: String, CodingKey {
-        case openAIAPIBaseURL       = "OPENAI_API_BASE_URL"
-        case openAIAPIKey           = "OPENAI_API_KEY"
-        case openAIParams           = "OPENAI_PARAMS"
-        case apiKey                 = "API_KEY"
-        case engine                 = "ENGINE"
-        case model                  = "MODEL"
-        case voice                  = "VOICE"
-        case splitOn                = "SPLIT_ON"
-        case azureSpeechRegion      = "AZURE_SPEECH_REGION"
-        case azureSpeechBaseURL     = "AZURE_SPEECH_BASE_URL"
+        case openAIAPIBaseURL        = "OPENAI_API_BASE_URL"
+        case openAIAPIKey            = "OPENAI_API_KEY"
+        case openAIParams            = "OPENAI_PARAMS"
+        case apiKey                  = "API_KEY"
+        case engine                  = "ENGINE"
+        case model                   = "MODEL"
+        case voice                   = "VOICE"
+        case splitOn                 = "SPLIT_ON"
+        case azureSpeechRegion       = "AZURE_SPEECH_REGION"
+        case azureSpeechBaseURL      = "AZURE_SPEECH_BASE_URL"
         case azureSpeechOutputFormat = "AZURE_SPEECH_OUTPUT_FORMAT"
+        case mistralAPIKey           = "MISTRAL_API_KEY"
+        case mistralAPIBaseURL       = "MISTRAL_API_BASE_URL"
     }
 
     init(from decoder: Decoder) throws {
@@ -1239,6 +1584,8 @@ struct AdminTTSConfig: Codable, Sendable {
         azureSpeechRegion      = (try? c.decode(String.self, forKey: .azureSpeechRegion))      ?? ""
         azureSpeechBaseURL     = (try? c.decode(String.self, forKey: .azureSpeechBaseURL))     ?? ""
         azureSpeechOutputFormat = (try? c.decode(String.self, forKey: .azureSpeechOutputFormat)) ?? "audio-24khz-160kbitrate-mono-mp3"
+        mistralAPIKey           = (try? c.decode(String.self, forKey: .mistralAPIKey))           ?? ""
+        mistralAPIBaseURL       = (try? c.decode(String.self, forKey: .mistralAPIBaseURL))       ?? "https://api.mistral.ai/v1"
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1260,19 +1607,23 @@ struct AdminTTSConfig: Codable, Sendable {
         try c.encode(azureSpeechRegion, forKey: .azureSpeechRegion)
         try c.encode(azureSpeechBaseURL, forKey: .azureSpeechBaseURL)
         try c.encode(azureSpeechOutputFormat, forKey: .azureSpeechOutputFormat)
+        try c.encode(mistralAPIKey, forKey: .mistralAPIKey)
+        try c.encode(mistralAPIBaseURL, forKey: .mistralAPIBaseURL)
     }
 
     init(
         openAIAPIBaseURL: String = "", openAIAPIKey: String = "", openAIParamsJSON: String = "{}",
         apiKey: String = "", engine: String = "", model: String = "", voice: String = "",
         splitOn: String = "punctuation", azureSpeechRegion: String = "",
-        azureSpeechBaseURL: String = "", azureSpeechOutputFormat: String = "audio-24khz-160kbitrate-mono-mp3"
+        azureSpeechBaseURL: String = "", azureSpeechOutputFormat: String = "audio-24khz-160kbitrate-mono-mp3",
+        mistralAPIKey: String = "", mistralAPIBaseURL: String = "https://api.mistral.ai/v1"
     ) {
         self.openAIAPIBaseURL = openAIAPIBaseURL; self.openAIAPIKey = openAIAPIKey
         self.openAIParamsJSON = openAIParamsJSON; self.apiKey = apiKey; self.engine = engine
         self.model = model; self.voice = voice; self.splitOn = splitOn
         self.azureSpeechRegion = azureSpeechRegion; self.azureSpeechBaseURL = azureSpeechBaseURL
         self.azureSpeechOutputFormat = azureSpeechOutputFormat
+        self.mistralAPIKey = mistralAPIKey; self.mistralAPIBaseURL = mistralAPIBaseURL
     }
 }
 
@@ -1280,6 +1631,7 @@ struct AdminTTSConfig: Codable, Sendable {
 struct AdminSTTConfig: Codable, Sendable {
     var openAIAPIBaseURL: String
     var openAIAPIKey: String
+    var openAIAPIRequestFormat: String   // "multipart" | "json"
     var engine: String
     var model: String
     var supportedContentTypes: [String]
@@ -1293,10 +1645,12 @@ struct AdminSTTConfig: Codable, Sendable {
     var mistralAPIKey: String
     var mistralAPIBaseURL: String
     var mistralUseChatCompletions: Bool
+    var noiseSuppression: Bool
 
     enum CodingKeys: String, CodingKey {
         case openAIAPIBaseURL           = "OPENAI_API_BASE_URL"
         case openAIAPIKey               = "OPENAI_API_KEY"
+        case openAIAPIRequestFormat     = "OPENAI_API_REQUEST_FORMAT"
         case engine                     = "ENGINE"
         case model                      = "MODEL"
         case supportedContentTypes      = "SUPPORTED_CONTENT_TYPES"
@@ -1310,12 +1664,14 @@ struct AdminSTTConfig: Codable, Sendable {
         case mistralAPIKey              = "MISTRAL_API_KEY"
         case mistralAPIBaseURL          = "MISTRAL_API_BASE_URL"
         case mistralUseChatCompletions  = "MISTRAL_USE_CHAT_COMPLETIONS"
+        case noiseSuppression           = "NOISE_SUPPRESSION"
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         openAIAPIBaseURL          = (try? c.decode(String.self, forKey: .openAIAPIBaseURL))          ?? ""
         openAIAPIKey              = (try? c.decode(String.self, forKey: .openAIAPIKey))              ?? ""
+        openAIAPIRequestFormat    = (try? c.decode(String.self, forKey: .openAIAPIRequestFormat))    ?? "multipart"
         engine                    = (try? c.decode(String.self, forKey: .engine))                    ?? ""
         model                     = (try? c.decode(String.self, forKey: .model))                     ?? ""
         supportedContentTypes     = (try? c.decode([String].self, forKey: .supportedContentTypes))   ?? []
@@ -1329,23 +1685,27 @@ struct AdminSTTConfig: Codable, Sendable {
         mistralAPIKey             = (try? c.decode(String.self, forKey: .mistralAPIKey))             ?? ""
         mistralAPIBaseURL         = (try? c.decode(String.self, forKey: .mistralAPIBaseURL))         ?? "https://api.mistral.ai/v1"
         mistralUseChatCompletions = (try? c.decode(Bool.self, forKey: .mistralUseChatCompletions))   ?? false
+        noiseSuppression          = (try? c.decode(Bool.self, forKey: .noiseSuppression))            ?? false
     }
 
     init(
-        openAIAPIBaseURL: String = "", openAIAPIKey: String = "", engine: String = "",
+        openAIAPIBaseURL: String = "", openAIAPIKey: String = "",
+        openAIAPIRequestFormat: String = "multipart", engine: String = "",
         model: String = "", supportedContentTypes: [String] = [], whisperModel: String = "base",
         deepgramAPIKey: String = "", azureAPIKey: String = "", azureRegion: String = "",
         azureLocales: String = "", azureBaseURL: String = "", azureMaxSpeakers: String = "",
         mistralAPIKey: String = "", mistralAPIBaseURL: String = "https://api.mistral.ai/v1",
-        mistralUseChatCompletions: Bool = false
+        mistralUseChatCompletions: Bool = false, noiseSuppression: Bool = false
     ) {
         self.openAIAPIBaseURL = openAIAPIBaseURL; self.openAIAPIKey = openAIAPIKey
+        self.openAIAPIRequestFormat = openAIAPIRequestFormat
         self.engine = engine; self.model = model; self.supportedContentTypes = supportedContentTypes
         self.whisperModel = whisperModel; self.deepgramAPIKey = deepgramAPIKey
         self.azureAPIKey = azureAPIKey; self.azureRegion = azureRegion
         self.azureLocales = azureLocales; self.azureBaseURL = azureBaseURL
         self.azureMaxSpeakers = azureMaxSpeakers; self.mistralAPIKey = mistralAPIKey
         self.mistralAPIBaseURL = mistralAPIBaseURL; self.mistralUseChatCompletions = mistralUseChatCompletions
+        self.noiseSuppression = noiseSuppression
     }
 }
 
@@ -1698,6 +2058,12 @@ struct TerminalServerConnection: Codable, Sendable {
     var key: String?
     var auth_type: String?
     var config: TerminalServerConnectionConfig?
+    /// Whether this terminal server is available in chat sessions.
+    var enable_in_chats: Bool?
+    /// Whether this terminal server is available in automations.
+    var enable_in_automations: Bool?
+    /// Scope of the terminal server ("global" | "user" | "admin").
+    var scope: String?
 
     init(
         id: String? = "",
@@ -1707,7 +2073,10 @@ struct TerminalServerConnection: Codable, Sendable {
         path: String? = "/openapi.json",
         key: String? = "",
         auth_type: String? = "bearer",
-        config: TerminalServerConnectionConfig? = TerminalServerConnectionConfig()
+        config: TerminalServerConnectionConfig? = TerminalServerConnectionConfig(),
+        enable_in_chats: Bool? = true,
+        enable_in_automations: Bool? = true,
+        scope: String? = "global"
     ) {
         self.id = id
         self.name = name
@@ -1717,6 +2086,9 @@ struct TerminalServerConnection: Codable, Sendable {
         self.key = key
         self.auth_type = auth_type
         self.config = config
+        self.enable_in_chats = enable_in_chats
+        self.enable_in_automations = enable_in_automations
+        self.scope = scope
     }
 
     var displayName: String {
@@ -1797,6 +2169,8 @@ struct RetrievalConfig: Codable, Sendable {
 
     // Tika
     var tikaServerURL: String
+    /// Which version of the Tika server to use ("3" or "4"). New in OpenWebUI v0.12+.
+    var tikaServerVersion: String
 
     // Docling
     var doclingServerURL: String
@@ -1861,6 +2235,15 @@ struct RetrievalConfig: Codable, Sendable {
     var fileImageCompressionWidth: Int?
     var fileImageCompressionHeight: Int?
 
+    // Knowledge file retention
+    var enableKnowledgeFileRetention: Bool
+
+    // RAG CSV shape summary
+    var enableRagCsvSummary: Bool
+
+    // RAG metadata max value chars (nil = no limit)
+    var ragMetadataMaxValueChars: Int?
+
     // Integration
     var enableGoogleDriveIntegration: Bool
     var enableOneDriveIntegration: Bool
@@ -1876,6 +2259,7 @@ struct RetrievalConfig: Codable, Sendable {
         case externalDocumentLoaderURL = "EXTERNAL_DOCUMENT_LOADER_URL"
         case externalDocumentLoaderAPIKey = "EXTERNAL_DOCUMENT_LOADER_API_KEY"
         case tikaServerURL = "TIKA_SERVER_URL"
+        case tikaServerVersion = "TIKA_SERVER_VERSION"
         case doclingServerURL = "DOCLING_SERVER_URL"
         case doclingAPIKey = "DOCLING_API_KEY"
         case doclingParams = "DOCLING_PARAMS"
@@ -1923,6 +2307,9 @@ struct RetrievalConfig: Codable, Sendable {
         case fileMaxCount = "FILE_MAX_COUNT"
         case fileImageCompressionWidth = "FILE_IMAGE_COMPRESSION_WIDTH"
         case fileImageCompressionHeight = "FILE_IMAGE_COMPRESSION_HEIGHT"
+        case enableKnowledgeFileRetention = "ENABLE_KNOWLEDGE_FILE_RETENTION"
+        case enableRagCsvSummary = "ENABLE_RAG_CSV_SUMMARY"
+        case ragMetadataMaxValueChars = "RAG_METADATA_MAX_VALUE_CHARS"
         case enableGoogleDriveIntegration = "ENABLE_GOOGLE_DRIVE_INTEGRATION"
         case enableOneDriveIntegration = "ENABLE_ONEDRIVE_INTEGRATION"
         case web
@@ -1938,6 +2325,7 @@ struct RetrievalConfig: Codable, Sendable {
         externalDocumentLoaderURL = (try? c.decode(String.self, forKey: .externalDocumentLoaderURL)) ?? ""
         externalDocumentLoaderAPIKey = (try? c.decode(String.self, forKey: .externalDocumentLoaderAPIKey)) ?? ""
         tikaServerURL = (try? c.decode(String.self, forKey: .tikaServerURL)) ?? ""
+        tikaServerVersion = (try? c.decode(String.self, forKey: .tikaServerVersion)) ?? "3"
         doclingServerURL = (try? c.decode(String.self, forKey: .doclingServerURL)) ?? ""
         doclingAPIKey = (try? c.decode(String.self, forKey: .doclingAPIKey)) ?? ""
         // DOCLING_PARAMS can be an object — serialize to string
@@ -2009,6 +2397,10 @@ struct RetrievalConfig: Codable, Sendable {
         fileImageCompressionWidth = try? c.decode(Int.self, forKey: .fileImageCompressionWidth)
         fileImageCompressionHeight = try? c.decode(Int.self, forKey: .fileImageCompressionHeight)
 
+        enableKnowledgeFileRetention = (try? c.decode(Bool.self, forKey: .enableKnowledgeFileRetention)) ?? false
+        enableRagCsvSummary = (try? c.decode(Bool.self, forKey: .enableRagCsvSummary)) ?? false
+        ragMetadataMaxValueChars = try? c.decode(Int.self, forKey: .ragMetadataMaxValueChars)
+
         enableGoogleDriveIntegration = (try? c.decode(Bool.self, forKey: .enableGoogleDriveIntegration)) ?? false
         enableOneDriveIntegration = (try? c.decode(Bool.self, forKey: .enableOneDriveIntegration)) ?? false
 
@@ -2024,6 +2416,7 @@ struct RetrievalConfig: Codable, Sendable {
         try c.encode(externalDocumentLoaderURL, forKey: .externalDocumentLoaderURL)
         try c.encode(externalDocumentLoaderAPIKey, forKey: .externalDocumentLoaderAPIKey)
         try c.encode(tikaServerURL, forKey: .tikaServerURL)
+        try c.encode(tikaServerVersion, forKey: .tikaServerVersion)
         try c.encode(doclingServerURL, forKey: .doclingServerURL)
         try c.encode(doclingAPIKey, forKey: .doclingAPIKey)
         // Encode DOCLING_PARAMS as JSON object
@@ -2083,6 +2476,9 @@ struct RetrievalConfig: Codable, Sendable {
         try c.encode(fileMaxCount, forKey: .fileMaxCount)
         try c.encode(fileImageCompressionWidth, forKey: .fileImageCompressionWidth)
         try c.encode(fileImageCompressionHeight, forKey: .fileImageCompressionHeight)
+        try c.encode(enableKnowledgeFileRetention, forKey: .enableKnowledgeFileRetention)
+        try c.encode(enableRagCsvSummary, forKey: .enableRagCsvSummary)
+        try c.encode(ragMetadataMaxValueChars, forKey: .ragMetadataMaxValueChars)
         try c.encode(enableGoogleDriveIntegration, forKey: .enableGoogleDriveIntegration)
         try c.encode(enableOneDriveIntegration, forKey: .enableOneDriveIntegration)
         try c.encode(web, forKey: .web)
@@ -2096,6 +2492,7 @@ struct RetrievalConfig: Codable, Sendable {
         externalDocumentLoaderURL = ""
         externalDocumentLoaderAPIKey = ""
         tikaServerURL = ""
+        tikaServerVersion = "3"
         doclingServerURL = ""
         doclingAPIKey = ""
         doclingParams = "{}"
@@ -2143,6 +2540,9 @@ struct RetrievalConfig: Codable, Sendable {
         fileMaxCount = nil
         fileImageCompressionWidth = nil
         fileImageCompressionHeight = nil
+        enableKnowledgeFileRetention = false
+        enableRagCsvSummary = false
+        ragMetadataMaxValueChars = nil
         enableGoogleDriveIntegration = false
         enableOneDriveIntegration = false
         web = WebSearchConfig()
@@ -2388,16 +2788,22 @@ struct GroupSharingPermissions: Codable, Sendable {
 /// Access-grant permissions.
 struct GroupAccessGrantPermissions: Codable, Sendable {
     var allowUsers: Bool
+    var allowGroups: Bool   // v0.11.0: groups can also grant access
 
     enum CodingKeys: String, CodingKey {
-        case allowUsers = "allow_users"
+        case allowUsers  = "allow_users"
+        case allowGroups = "allow_groups"
     }
 
-    init(allowUsers: Bool = true) { self.allowUsers = allowUsers }
+    init(allowUsers: Bool = true, allowGroups: Bool = false) {
+        self.allowUsers = allowUsers
+        self.allowGroups = allowGroups
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        allowUsers = (try? c.decode(Bool.self, forKey: .allowUsers)) ?? true
+        allowUsers  = (try? c.decode(Bool.self, forKey: .allowUsers))  ?? true
+        allowGroups = (try? c.decode(Bool.self, forKey: .allowGroups)) ?? false
     }
 }
 
@@ -2762,6 +3168,329 @@ struct OllamaRunningModel: Codable, Identifiable, Sendable {
 
 struct OllamaRunningModelsResponse: Codable, Sendable {
     let models: [OllamaRunningModel]
+}
+
+// MARK: - Feedback (Evaluations)
+
+/// A single user in a feedback record (lightweight version).
+struct FeedbackUser: Codable, Sendable, Identifiable {
+    let id: String
+    let name: String
+    let email: String
+    let role: String
+    let lastActiveAt: Int?
+    let updatedAt: Int?
+    let createdAt: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, email, role
+        case lastActiveAt = "last_active_at"
+        case updatedAt    = "updated_at"
+        case createdAt    = "created_at"
+    }
+}
+
+/// The `data` field of a feedback record.
+struct FeedbackData: Codable, Sendable {
+    let rating: Int?        // 1 = positive, -1 = negative (nil if not rated)
+    let modelId: String?
+    let siblingModelIds: [String]?
+    let reason: String?
+    let comment: String?
+    let tags: [String]?
+    let details: FeedbackDetails?
+
+    enum CodingKeys: String, CodingKey {
+        case rating
+        case modelId        = "model_id"
+        case siblingModelIds = "sibling_model_ids"
+        case reason, comment, tags, details
+    }
+}
+
+struct FeedbackDetails: Codable, Sendable {
+    let rating: Int?
+}
+
+/// The `meta` field of a feedback record.
+struct FeedbackMeta: Codable, Sendable {
+    let modelId: String?
+    let messageId: String?
+    let messageIndex: Int?
+    let chatId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case modelId      = "model_id"
+        case messageId    = "message_id"
+        case messageIndex = "message_index"
+        case chatId       = "chat_id"
+    }
+}
+
+/// A single message inside a feedback snapshot (from snapshot.chat.chat.messages).
+struct FeedbackSnapshotMessage: Codable, Sendable {
+    let id: String
+    let role: String
+    let content: String
+    let parentId: String?
+    let childrenIds: [String]?
+    let timestamp: Int?
+    let model: String?
+    let modelName: String?
+    let annotation: FeedbackSnapshotAnnotation?
+    let feedbackId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, role, content, timestamp, model, modelName, annotation
+        case parentId    = "parentId"
+        case childrenIds = "childrenIds"
+        case feedbackId  = "feedbackId"
+    }
+}
+
+struct FeedbackSnapshotAnnotation: Codable, Sendable {
+    let rating: Int?
+    let tags: [String]?
+}
+
+/// Inner chat object inside snapshot (snapshot.chat.chat).
+struct FeedbackSnapshotInnerChat: Codable, Sendable {
+    let title: String?
+    let models: [String]?
+    let messages: [FeedbackSnapshotMessage]?
+    let tags: [String]?
+}
+
+/// Outer chat object inside snapshot (snapshot.chat).
+struct FeedbackSnapshotOuterChat: Codable, Sendable {
+    let id: String?
+    let title: String?
+    let chat: FeedbackSnapshotInnerChat?
+    let updatedAt: Int?
+    let createdAt: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, chat
+        case updatedAt = "updated_at"
+        case createdAt = "created_at"
+    }
+}
+
+/// The `snapshot` field of a detailed feedback record.
+struct FeedbackSnapshot: Codable, Sendable {
+    let chat: FeedbackSnapshotOuterChat?
+}
+
+/// A single feedback record returned by the list or detail endpoint.
+struct FeedbackItem: Codable, Sendable, Identifiable {
+    let id: String
+    let userId: String
+    let version: Int?
+    let type: String?
+    let data: FeedbackData?       // nullable per OpenAPI spec (anyOf: [object, null])
+    let meta: FeedbackMeta?       // nullable per OpenAPI spec (anyOf: [object, null])
+    let snapshot: FeedbackSnapshot?
+    let createdAt: Int
+    let updatedAt: Int
+    let user: FeedbackUser?
+
+    enum CodingKeys: String, CodingKey {
+        case id, type, data, meta, snapshot, user, version
+        case userId    = "user_id"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+
+    /// Whether this is a positive (thumbs up) rating.
+    var isPositive: Bool { (data?.rating ?? 0) > 0 }
+
+    /// Formatted relative time string.
+    var relativeTimeString: String {
+        let date = Date(timeIntervalSince1970: TimeInterval(updatedAt))
+        let interval = Date().timeIntervalSince(date)
+        if interval < 60 { return "just now" }
+        if interval < 3600 { return "\(Int(interval / 60))m ago" }
+        if interval < 86400 { return "\(Int(interval / 3600))h ago" }
+        if interval < 86400 * 7 { return "\(Int(interval / 86400))d ago" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter.string(from: date)
+    }
+
+    /// The rated assistant message from the snapshot.
+    var ratedMessage: FeedbackSnapshotMessage? {
+        guard let messageId = meta?.messageId else { return nil }
+        return snapshot?.chat?.chat?.messages?.first { $0.id == messageId }
+    }
+
+    /// The user message that prompted the rated response.
+    var promptMessage: FeedbackSnapshotMessage? {
+        guard let rated = ratedMessage,
+              let parentId = rated.parentId else { return nil }
+        return snapshot?.chat?.chat?.messages?.first { $0.id == parentId }
+    }
+}
+
+/// Paginated list response from `/api/v1/evaluations/feedbacks/list`.
+struct FeedbackListResponse: Codable, Sendable {
+    let items: [FeedbackItem]
+    let total: Int
+}
+
+// MARK: - Notification Targets (v0.11.0)
+
+/// A single server-side notification target (webhook, email, etc.)
+/// GET /api/v1/notifications/targets  •  POST /api/v1/notifications/targets
+struct NotificationTarget: Codable, Sendable, Identifiable {
+    var id: String
+    var name: String
+    var type: String         // "webhook", "email", "slack", etc.
+    var url: String
+    var enabled: Bool
+    var isDefault: Bool
+    var createdAt: Int?
+    var updatedAt: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, type, url, enabled
+        case isDefault  = "is_default"
+        case createdAt  = "created_at"
+        case updatedAt  = "updated_at"
+    }
+
+    init(id: String = "", name: String = "", type: String = "webhook",
+         url: String = "", enabled: Bool = true, isDefault: Bool = false,
+         createdAt: Int? = nil, updatedAt: Int? = nil) {
+        self.id = id; self.name = name; self.type = type; self.url = url
+        self.enabled = enabled; self.isDefault = isDefault
+        self.createdAt = createdAt; self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id        = (try? c.decode(String.self, forKey: .id))        ?? ""
+        name      = (try? c.decode(String.self, forKey: .name))      ?? ""
+        type      = (try? c.decode(String.self, forKey: .type))      ?? "webhook"
+        url       = (try? c.decode(String.self, forKey: .url))       ?? ""
+        enabled   = (try? c.decode(Bool.self,   forKey: .enabled))   ?? true
+        isDefault = (try? c.decode(Bool.self,   forKey: .isDefault)) ?? false
+        createdAt = try? c.decode(Int.self, forKey: .createdAt)
+        updatedAt = try? c.decode(Int.self, forKey: .updatedAt)
+    }
+}
+
+/// Form for creating or updating a notification target.
+struct NotificationTargetForm: Codable, Sendable {
+    var name: String
+    var type: String
+    var url: String
+    var enabled: Bool
+
+    init(name: String = "", type: String = "webhook", url: String = "", enabled: Bool = true) {
+        self.name = name; self.type = type; self.url = url; self.enabled = enabled
+    }
+}
+
+/// Event types returned by GET /api/v1/notifications/events
+struct NotificationEvent: Codable, Sendable, Identifiable {
+    var id: String { name }
+    var name: String
+    var description: String?
+
+    init(name: String, description: String? = nil) {
+        self.name = name; self.description = description
+    }
+}
+
+// MARK: - Sub-agents Config (v0.11.0)
+
+/// GET /api/v1/configs/subagents  •  POST /api/v1/configs/subagents
+struct SubagentsConfig: Codable, Sendable {
+    var enableSubagents: Bool
+    var backgroundEnabled: Bool
+    var maxConcurrent: Int
+    var maxAsync: Int
+    var maxIterations: Int
+    var maxOutput: Int
+    var systemPrompt: String
+
+    enum CodingKeys: String, CodingKey {
+        case enableSubagents  = "ENABLE_SUBAGENTS"
+        case backgroundEnabled = "SUBAGENTS_BACKGROUND_ENABLED"
+        case maxConcurrent    = "SUBAGENTS_MAX_CONCURRENT"
+        case maxAsync         = "SUBAGENTS_MAX_ASYNC"
+        case maxIterations    = "SUBAGENTS_MAX_ITERATIONS"
+        case maxOutput        = "SUBAGENTS_MAX_OUTPUT"
+        case systemPrompt     = "SUBAGENTS_SYSTEM_PROMPT"
+    }
+
+    init(
+        enableSubagents: Bool = false,
+        backgroundEnabled: Bool = true,
+        maxConcurrent: Int = 20,
+        maxAsync: Int = 20,
+        maxIterations: Int = 30,
+        maxOutput: Int = 30000,
+        systemPrompt: String = ""
+    ) {
+        self.enableSubagents  = enableSubagents
+        self.backgroundEnabled = backgroundEnabled
+        self.maxConcurrent    = maxConcurrent
+        self.maxAsync         = maxAsync
+        self.maxIterations    = maxIterations
+        self.maxOutput        = maxOutput
+        self.systemPrompt     = systemPrompt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enableSubagents  = (try? c.decode(Bool.self,   forKey: .enableSubagents))  ?? false
+        backgroundEnabled = (try? c.decode(Bool.self,  forKey: .backgroundEnabled)) ?? true
+        maxConcurrent    = (try? c.decode(Int.self,    forKey: .maxConcurrent))    ?? 20
+        maxAsync         = (try? c.decode(Int.self,    forKey: .maxAsync))         ?? 20
+        maxIterations    = (try? c.decode(Int.self,    forKey: .maxIterations))    ?? 30
+        maxOutput        = (try? c.decode(Int.self,    forKey: .maxOutput))        ?? 30000
+        systemPrompt     = (try? c.decode(String.self, forKey: .systemPrompt))    ?? ""
+    }
+}
+
+// MARK: - User Chat Variables (v0.11.0)
+
+/// A single user-defined chat variable (key/value pair used as {{VAR_NAME}} in prompts).
+struct UserVariable: Codable, Sendable, Identifiable {
+    var id: String { key }
+    var key: String
+    var value: String
+
+    init(key: String = "", value: String = "") {
+        self.key = key; self.value = value
+    }
+}
+
+/// GET /api/v1/users/user/variables  •  POST /api/v1/users/user/variables/update
+/// The server returns/accepts a flat dictionary of string→string.
+struct UserVariables: Codable, Sendable {
+    var variables: [String: String]
+
+    init(variables: [String: String] = [:]) {
+        self.variables = variables
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        variables = (try? c.decode([String: String].self)) ?? [:]
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(variables)
+    }
+
+    /// Ordered list of variables for display.
+    var orderedList: [UserVariable] {
+        variables.sorted { $0.key < $1.key }.map { UserVariable(key: $0.key, value: $0.value) }
+    }
 }
 
 /// Returns the MIME type for a given file extension.

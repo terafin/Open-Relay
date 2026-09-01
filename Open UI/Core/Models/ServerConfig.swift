@@ -49,6 +49,13 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
     /// The URL the proxy redirected to (auth portal URL) — used to re-scope cookies.
     var proxyAuthPortalURL: String?
 
+    /// Optional URL for a model-switch status endpoint (issue #79).
+    /// When set, Open Relay polls this URL every 1 s while a chat request is
+    /// pending and shows a progress banner if the backend is switching models.
+    /// Example: `"http://192.168.1.10:8091/v1/switch/status"`
+    /// Leave nil or empty to disable the feature entirely.
+    var switchStatusURL: String?
+
     /// API key — stored in Keychain, NOT serialised to UserDefaults.
     /// Populated transiently at runtime via ``KeychainService``.
     var apiKey: String?
@@ -88,6 +95,7 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         case proxyAuthCookies, isAuthProxyProtected, proxyAuthPortalURL
         case lastUserName, lastUserEmail, lastUserProfileImageURL, lastAuthType, hasActiveSession
         case savedAccounts, activeAccountId
+        case switchStatusURL
     }
 
     /// Custom decoder so existing saved configs (without the new metadata fields)
@@ -116,6 +124,7 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         hasActiveSession = (try? c.decode(Bool.self, forKey: .hasActiveSession)) ?? false
         savedAccounts = (try? c.decode([SavedAccount].self, forKey: .savedAccounts)) ?? []
         activeAccountId = try? c.decode(String.self, forKey: .activeAccountId)
+        switchStatusURL = try? c.decode(String.self, forKey: .switchStatusURL)
         apiKey = nil // always nil from storage; loaded from Keychain at runtime
     }
 
@@ -141,7 +150,8 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         lastAuthType: AuthType? = nil,
         hasActiveSession: Bool = false,
         savedAccounts: [SavedAccount] = [],
-        activeAccountId: String? = nil
+        activeAccountId: String? = nil,
+        switchStatusURL: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -165,6 +175,7 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         self.hasActiveSession = hasActiveSession
         self.savedAccounts = savedAccounts
         self.activeAccountId = activeAccountId
+        self.switchStatusURL = switchStatusURL
     }
 
     /// Whether the persisted `cf_clearance` cookie is still valid (not expired).

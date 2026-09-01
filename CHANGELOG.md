@@ -1,5 +1,372 @@
 # Changelog
 
+## v5.5.2 — September 1, 2026
+
+### Improvements
+- Tightened conversation row spacing in the sidebar.
+- Removed the duplicate update notification icon from the top of the sidebar
+
+### Bug Fixes
+- Fixed tool call cards showing a checkmark immediately when the model writes the call request
+- Fixed responses finishing prematurely during long-running tool calls — the recovery timer no longer treats an empty task list as "done" when there is still an in-progress tool call waiting for a result.
+- Fixed responses being marked as finished when returning from the background too quickly
+
+## v5.5.1 — August 27, 2026
+
+### What's New
+- Added custom photo picker
+
+### Improvements
+- Allow OpenWebUI's new streaming architecture that now sends tokens as `response:completion` delta events which the app was silently discarding.
+
+### Bug Fixes
+- Fixed assistant messages not appearing when sending new messages after clearing chat history or continuing responses
+- Fixed TTS related issues with sentence breaking.
+- Fixed app icon showing a badge number after every message even when the response finished while you were still in the app — the badge now only appears when you go to the home screen while a response is still streaming.
+
+
+## v5.5 — August 26, 2026
+
+### What's New
+- Added in-app browser: tapping links and citation chips now opens a built-in browser instead of leaving the app.
+- Added "Open links in app" toggle in Settings → Chat → Chat Behavior to disable the in-app browser for users who prefer to open links in Safari directly. On by default.
+- Added API key management to Privacy & Security settings — generate, copy, and revoke your server API key directly from the app.
+- Added human-in-the-loop tool approval: when your server admin enables it, a "Tool Permissions" entry appears in the + attachment menu with a sub-page to switch between Full access (tools run automatically) and Ask for approval (pauses before each tool call for Allow/Deny)
+- Added ask-user question cards: models can now pause mid-response to ask you up to three multiple-choice questions before continuing, with an optional free-text answer field, the question surviving a reload so you can answer it later, and a live countdown timer for time-sensitive prompts.
+
+### Improvements
+- Failed tool calls now show a red ✗ instead of a green ✓, making it easy to spot when a tool ran into an error.
+- Profile pictures that fail to load (such as those belonging to deleted accounts) now fall back to the default avatar instead of showing a broken placeholder.
+- Typing @ in a channel now lists members in alphabetical order for more predictable results.
+- Attaching a file and sending a message before the upload finishes now queues the message and sends it automatically once the upload completes.
+- Added OpenSERP as a web search engine option in Admin → Web Search.
+- Admin Documents: added Knowledge File Retention, CSV Shape Summary, and Metadata Max Value Characters settings.
+- Admin Interface: added Task Model Generation Parameters editor with individual controls for all parameters (Temperature, top_k, top_p, Reasoning Effort, Function Calling, and more) — each defaults to "Default" and can be set individually, matching the web interface exactly.
+- Admin Interface: added Default Interface Settings editor for configuring server-wide defaults applied to all new chats.
+- Admin Integrations: Terminal server connections now have Enable in Chats, Enable in Automations, and Scope settings.
+- Admin Groups: added Import Members button in the Users tab — import group members from a CSV file containing email addresses.
+- Automations: added Channel Destination option so automation responses can be posted to a specific channel instead of creating a new chat.
+
+### Bug Fixes
+- Fixed server update changelog api to github as the webui api does not provide the current update changelog.
+
+## v5.4.2 — August 24, 2026
+
+### Improvements
+- Responses now show a notification when interrupted mid-stream (e.g. if the app was backgrounded too long), so you always know to tap back in and retry.
+- Channel message notifications no longer stack up as duplicates from the same person — each sender gets one banner that updates in place.
+- App badge now increments when responses or channel messages arrive, and clears when you tap a notification.
+
+### Bug Fixes
+- Fixed tool call responses being dropped when a model executes multiple tools concurrently.
+- Fixed a bug where content could appear doubled in responses that use the structured output format.
+- Fixed a bug where Socket.IO connection "user-join" handshake could silently leak memory if the app was backgrounded during the 5-second acknowledgement window.
+- Fixed a race condition in the Socket.IO polling transport where rapid reconnects could spawn two simultaneous polling loops, causing duplicate or dropped events.
+- Fixed the streaming URL session not being reset when switching servers, which could send requests to the wrong server after a switch.
+- Fixed a bug where the same AI response could fire two separate "response ready" notification banners (one from background polling and one from foreground recovery).
+
+## v5.4.1 — August 23, 2026
+
+### Bug Fixes
+- Fixed admin users unable to edit models in Admin Console
+- Fixed starred tool quick-action pills disappearing on app launch and new chat
+
+## v5.4 — August 22, 2026
+
+### What's New
+- Added Controls panel (tap the slider icon in any chat) showing attached files, knowledge bases, reference chats, system prompt override, and tool/function valve settings
+
+### Improvements
+- Improved server switching: the "Switch Server" screen now has an X button to dismiss without switching, server rows show a reachability check before committing a switch, and the connection-lost overlay presents the switcher as a dismissible sheet.
+
+### Bug Fixes
+- Fixed starred tool buttons persisting in the quick-actions row after a tool is deleted or removed from the server.
+- Fixed hidden models not appearing in the workspace model editor's base model picker — admins can now select any enabled model (including hidden ones) as a base model when creating or editing workspace models, matching Open WebUI web behavior.
+
+## v5.3.9 — August 21, 2026
+
+### Improvements
+- Admin Models screen now shows workspace custom models (e.g. models you've created from a base) alongside base models.
+
+### Bug Fixes
+- Fixed second (and subsequent) reasoning/thinking blocks not appearing during streaming.
+- Fixed admin model list only loading the first 30 models when more than 30 exist.
+- Fixed all users appearing to have edit access to models they don't own; edit button is now greyed out for read-only models.
+- Fixed "Hide Model" / "Show Model" failing for Ollama and other base models that don't yet have a workspace record.
+- Fixed admin model settings (built-in tools toggles) always resetting to default because the server key names didn't match what the app expected.
+- Fixed model public/private badge always showing "PRIVATE" due to access grants being checked in the wrong place.
+
+## v5.3.8 — August 19, 2026
+
+### Bug Fixes
+- Fixed follow-up suggestions disappearing ~2 seconds after appearing due to server sync overwriting them with an empty array.
+- Fixed follow-up suggestions not persisting when editing a message or switching between message versions.
+- Fixed follow-up suggestions never appearing after regenerating a response.
+- Fixed reasoning blocks displaying as raw HTML instead of rendering natively during streaming.
+
+## v5.3.7 — August 19, 2026
+
+### Bug Fixes
+- Fixed pinned chats inside folders not appearing in the Pinned section.
+- Fixed iPad hamburger menu button not responding to taps when sidebar auto-hide mode is enabled
+
+## v5.3.6 — August 17, 2026
+
+### Bug Fixes
+- Fixed text getting stuck when a response involves multiple sequential blocks
+- Fixed crash when opening a Voice Call on macOS
+- Fixed login screen appearing after returning from a long background
+
+## v5.3.5 — August 15, 2026
+
+### Bug Fixes
+- Fixed HTTP polling fallback timing out after 60 seconds of silent processing — responses from long-running tasks now wait for the server to confirm the task is complete before finalising, preventing truncated or missing responses.
+
+## v5.3.4 — August 14, 2026
+
+### Improvements
+- Minor animation tweaking throughout the app for smoothness.
+
+### Bug Fixes
+- Fixed app logging out on every launch — removed an overly aggressive JWT expiry check that was treating tokens with less than 5 minutes remaining as already expired, matching Open WebUI's approach of letting the server decide token validity via 401.
+
+## v5.3.3 — August 14, 2026
+
+### Bug Fixes
+- Fixed app permanently freezing on the launch screen when the server was slow or unreachable.
+- Fixed login screen briefly flashing on launch when on a slow or unreachable network.
+- Fixed iPad crashing on launch when "Always Show Sidebar" was enabled in Appearance settings.
+- Fixed new chat button (✏️) not appearing in the navbar when inside a chat on iPad.
+
+## v5.3.2 — August 13, 2026
+
+### Improvements
+- Improved valve editing for tools and functions
+
+### Bug Fixes
+- Fixed sending a message after deleting the last message in a chat incorrectly adding it as a version of the deleted message instead of starting a fresh new chat.
+
+## v5.3.1 — August 12, 2026
+
+### Improvements
+- Improved networking resilience with automatic retry (up to 2 attempts with backoff) on transient network errors and server errors across all API calls.
+- Improved streaming resilience with a 60-second stall watchdog that terminates hung SSE connections instead of waiting forever.
+- Improved session security by automatically signing out when any API call receives a 401, so expired tokens never leave the app in a broken state.
+- Improved streaming reliability by correctly handling multi-line server-sent events per the SSE spec.
+- Improved stop-generation to cancel all server-side tasks for a chat in a single request instead of one per task.
+- Improved session security by automatically treating stored auth tokens as expired when they are within 5 minutes of their expiry time, preventing 401 errors mid-session.
+- Improved image loading efficiency with conditional HTTP requests (ETag/Last-Modified), allowing the server to respond with 304 Not Modified and skip re-downloading unchanged images.
+
+### Bug Fixes
+- Fixed app getting stuck on the loading screen when the server is slow or temporarily unreachable on launch.
+
+## v5.3 — August 12, 2026
+
+### What's New
+- Folders now support a custom emoji icon and background images
+- Folder workspace landing screen now shows a scrollable list of recent chats so you can quickly jump back into any conversation
+
+### Improvements
+- Improved server-side background task handling (title generation, follow-up suggestions, tags) to correctly respect your settings and match web client behavior.
+
+### Bug Fixes
+- Fixed "Rename" option appearing on chats inside read-only shared folders where editing is not permitted
+- Fixed markdown syntax not rendering in user messages when "Render markdown in user messages" is enabled
+
+## v5.2.4 — August 9, 2026
+
+### Improvements
+- Significantly improved connection reliability for self-hosted servers on local networks
+
+### Bug Fixes
+- Fixed Engine.IO heartbeat sending in the wrong direction
+
+## v5.2.3 — August 7, 2026
+
+### Bug Fixes
+- Fixed response text after a tool call not appearing during streaming
+- Fixed chat messages overflowing horizontally past the screen edge on smaller iPhones
+
+## v5.2.2 — August 5, 2026
+
+### Improvements
+- Chats started inside a folder now correctly send the folder context to the server, ensuring folder-level knowledge and system prompts are applied and the sidebar updates properly.
+
+### Bug Fixes
+- Fixed memories not being used in chat — the app now correctly falls back to the server's global memories setting when no explicit preference is stored in the user's account, matching OpenWebUI's behavior.
+
+## v5.2.1 — August 5, 2026
+
+### What's New
+- Added iPad sidebar layout toggle in Settings → Appearance: choose between "Always Show Sidebar" (pinned split-view) or the default slide-out drawer overlay.
+
+### Bug Fixes
+- Fixed tool calls causing the entire chat response to freeze with no output
+- Fixed tool call responses silently delivering no content — events containing only tool call data (no text yet) are no longer dropped.
+- Fixed tool call JSON arguments being corrupted
+
+## v5.2 — August 4, 2026
+
+### Improvements
+- Added option in Privacy & Security settings to exclude downloaded AI models (TTS/ASR) from iCloud backup — models are redownloadable so they don't need to consume iCloud storage. Enabled by default. (Turn Open Relay off/on in the icloud backup setting to apply.)
+
+### Bug Fixes
+- Fixed workspace model system prompts being ignored mid-conversation — the app now correctly falls back to the model's server-side system prompt when no per-chat or personal default prompt is set, so changes made in the OpenWebUI workspace are picked up immediately.
+- Fixed memories not being injected into conversations — the memory enabled/disabled toggle now stays in sync across all new chats opened after the toggle is changed.
+
+## v5.1 — August 1, 2026
+
+### What's New
+- Added swipe-to-reply gesture in channels — swipe right on any message to reply.
+- Reply previews inside message bubbles now show the sender's avatar, name, and a content preview, and tapping them scrolls to and highlights the original message.
+- Reply bar above the keyboard now shows the sender's avatar, a reply arrow icon, and message preview for clear context.
+
+### Improvements
+- Channels now show a compact single-line reply preview (sender avatar + bold name + italic message) matching the Open WebUI web style.
+- Sidebar hamburger button now works in channel views on both iPhone and iPad — tap it to slide open the conversation list from any channel.
+- iPad: selecting a channel from the sidebar now correctly closes the drawer and loads the channel.
+- iPad sidebar now slides in and out with the same push/scale/blur animation as iPhone — tap the sidebar button or swipe from the left edge to open, swipe left or tap the content to close.
+- Channels now show a live "X is typing…" indicator with an animated dot pulse when another user is composing a message.
+- New channels and DM conversations started by others now appear in your sidebar instantly without needing to pull-to-refresh.
+- Thread reply counts and "# replies" badges on channel messages now update in real time when a new reply is posted.
+- Channel member presence state and status emoji/message are now fetched from the server for more accurate online indicators.
+- AI model responses in channels now show an animated "Generating…" indicator in the bubble while the model is writing its first tokens, instead of a blank gap.
+
+### Bug Fixes
+- Fixed DM conversations showing the wrong name — the recipient's sidebar now correctly shows the sender's name instead of their own name.
+- Fixed online/offline status dot in DM conversations always showing as offline even when the other user is actively connected — now correctly reflects the server's real-time active status both in the sidebar and inside the DM.
+- Fixed iPad sidebar hamburger menu button not appearing when on the new chat screen or inside a chat.
+- Fixed chat responses sometimes never arriving after sending a message, with the server showing "Checking..." indefinitely — caused by a timing race where messages could be sent before the connection was fully ready.
+- Fixed the app treating local network servers differently from remote ones, which could cause inconsistent connection status.
+- Fixed channel lifecycle events (channel updated/deleted) not being handled in the sidebar, which could leave stale channels visible.
+- Fixed occasional duplicate messages when sending two identical messages in quick succession in a channel.
+
+## v5.0 — July 31, 2026
+
+### What's New
+- Added Continue button to the assistant action bar — tap to append new content to an incomplete or truncated response.
+- Added Fork Chat button to the assistant action bar — clone any conversation and jump straight to the fork.
+- Added Notification Targets — configure push/webhook notification destinations in Profile settings (requires OpenWebUI v0.11.0+).
+- Added Sub-agents support — enable and configure sub-agents from Admin Console; background subagent mode works in chat.
+- Added Chat Variables — define and save personal variables from your profile that can be referenced in chats (requires OpenWebUI v0.11.0+).
+- Added LDAP Group Sync and Allow Groups permission controls in Admin → General → Auth (requires OpenWebUI v0.11.0+).
+- Added Files, Notifications, and Sub-agents tool toggles to the model editor.
+- Added new Admin Console → Settings tabs: Database (import/export config, export chats), Pipelines (manage pipeline valves), Events (webhooks with per-event filtering), and Authentication (LDAP, OAuth/OIDC, access defaults).
+- Added External Knowledge Sources in Admin → Settings → Integrations.
+- Added Memory System Context and Channel Model Response Mode toggles to Admin → General → Features.
+- Added Context Compaction section to Admin → Interface for summarising long chat histories.
+
+### Improvements
+- Editing an AI response now saves in-place without triggering a new reply — matching the web UI behavior.
+- Admin permissions now correctly gate dictation, voice call, read-aloud, regenerate, edit, and ratings in chat.
+- "Attach Notes" in the tools sheet is hidden when the server has Notes disabled.
+- Admin → Interface now saves chat config (context compaction) alongside task config in a single Save action.
+- All Admin Console text fields are now always-visible multiline boxes — no swipe gesture required.
+- Chat composer now expands into a large writing area when you swipe up — swipe down to collapse.
+
+### Bug Fixes
+- Fixed jittery scroll, layout jumps, and nav bar flickering at the bottom of chats.
+- Fixed Admin → General settings save failing with a validation error.
+- Fixed cloning a workspace model failing with "session expired" — now opens a pre-filled editor to review before saving.
+- Fixed workspace model list showing a sparkles icon instead of the model's avatar.
+
+## v4.15.9 — July 26, 2026
+
+### Bug Fixes
+- Fixed saving Admin → Settings → Interface failing with an error due to missing fields in the request.
+- Fixed clearing the system prompt in My Defaults not persisting after saving.
+
+## v4.15.8 — July 25, 2026
+
+### Bug Fixes
+- Fixed Custom Headers editor missing from the "Add Server" sheet
+
+## v4.15.7 — July 23, 2026
+
+### Improvements
+- Smoother animation when switching between message versions
+
+### Bug Fixes
+- Fixed connection stalling and "Server Unreachable" overlay appearing immediately after login when using a local/LAN-only server.
+- Fixed deleted message versions reappearing after regenerating a response in the same session.
+- Fixed tool-generated attachments not being saved to the server, causing them to disappear when switching versions in the app.
+- Fixed editing a message with attachments — the edit bar now shows existing attachments as chips with a × button to remove them before resending.
+
+## v4.15.6 — July 22, 2026
+
+### Bug Fixes
+- Fixed connection stalling immediately after login in some cases.
+- Fixed Settings → Server connection check getting permanently stuck on "Checking" with a gray dot instead of resolving to green or red.
+- Fixed default system prompt and inference parameters going stale — the app now re-fetches your settings from the server when returning from background and when starting a new chat, so changes made on the web UI or another device are picked up immediately.
+
+## v4.15.5 — July 17, 2026
+
+### Improvements
+- Improved drawer opening/closing and general smoothness
+- Minor performance updates
+
+## v4.15.4 — July 15, 2026
+
+### Bug Fixes
+- Fixed false positive proxy detection bug.
+- Fixed adding a server with the same URL as an existing one wiping all saved accounts on that server.
+- Fixed signed-out account appearing greyed out in the account picker, preventing re-login without switching accounts first.
+
+## v4.15.3 — July 14, 2026
+
+### Bug Fixes
+- Improved proxy auth login reliability
+
+## v4.15.2 — July 14, 2026
+
+### Bug Fixes
+- Fixed Rich UI embed webviews (weather cards, dashboards, music players, etc.) not appearing after 0.10+ update
+
+## v4.15.1 — July 9, 2026
+
+### Bug Fixes
+- Improved streaming resilience for slow models — responses from large reasoning models, long MCP tool chains, and local models should no longer time out prematurely.
+
+## v4.15 — July 8, 2026
+
+### What's New
+- Added message rating system - If server has message rating enabled, the user can provide feedback mirroring webui behavior.
+- Added Evaluations panel in Admin Console — admins can browse the feedback history. Leaderboard coming soon.
+
+## v4.14 — July 7, 2026
+
+### What's New
+- Added URL scheme support — open a new chat from Raycast, Shortcuts, Obsidian, or any app using `openui://new-chat?prompt=Hello&model=gpt-4o&send=true`.
+- Added "Ask Open Relay" Shortcuts action — create a new chat with a prompt, optional model, and auto-send directly from Apple Shortcuts. This is a start and will be expanded upon for more usability.
+- Added model-switch progress banner for SGLang and OpenAI-compatible backends — when a status URL is configured per-server, a banner shows "Loading qwen3-35b ~42s left" while the model loads.
+
+### Improvements
+- Enhanced image and file attachment previews: images now display inlined in chat above the text bubble 
+
+### Bug Fixes
+- Fixed occasional app freezing on launch when a large chat was previously open.
+- Fixed update notification not appearing instantly after a new version is released on the App Store.
+- Fixed "Check for Updates" and "Check for Server Updates" buttons showing "Up to date" (green) after dismissing an update dialogue, even when an update is available.
+
+## v4.13.1 — July 7, 2026
+
+### Improvements
+- Replaced the bouncing typing dots with a clean blinking cursor while waiting for the AI response to start.
+
+### Bug Fixes
+- Fixed model response getting stuck inside the tool call dropdown during streaming
+- Fixed server-generated files showing as non-tappable links
+
+## v4.13 — July 4, 2026
+
+### What's New
+- Added Shared Folders — share any folder of chats with specific people or groups, set read or write access, and browse folders others have shared with you directly from the sidebar. Chats in read-only shared folders open in view-only mode with a lock banner instead of the input field.
+- Added "Revoke All" button in Shared Chats — revoke every shared link at once with a single tap and confirmation.
+- Added "Clone" option in Automations — duplicate any automation as a starting point from its context menu.
+
+### Improvements
+- Further scrolling/animation smoothness.
+
 ## v4.12 — June 29, 2026
 
 ### What's New
@@ -72,8 +439,6 @@
 
 ### Improvements
 - Improved the animation on app launch
-
-### Bug Fixes
 
 ## v4.9.2 — June 4, 2026
 
@@ -156,7 +521,6 @@
 ### Bug Fixes
 - Fixed the app signing you out when your server is temporarily unreachable — transient connectivity issues should no longer clear your session.
 
-
 ## v4.5.3 — May 18, 2026
 
 ### Bug Fixes
@@ -169,7 +533,6 @@
 - Fixed sidebar sections (Pinned, Today, Yesterday, etc.) resetting to expanded on every app launch — collapse state now persists across launches.
 - Fixed various server-level enabled/disabled settings.
 
-
 ## v4.5.1 — May 16, 2026
 
 ### Improvements
@@ -177,7 +540,6 @@
 
 ### Bug Fixes
 - Fixed the chat scrolling back to the bottom after streaming ends if the user had manually scrolled up during the response.
-
 
 ## v4.5 — May 15, 2026
 
@@ -193,7 +555,6 @@
 ### Bug Fixes
 - Fixed a race condition where streaming auto-scroll would randomly disengage mid-response.
 
-
 ## v4.4 — May 14, 2026
 
 ### What's New
@@ -204,7 +565,6 @@
 
 ### Bug Fixes
 - Fixed double requests (false emoji generation) being sent on every request.
-
 
 ## v4.3 — May 13, 2026
 
@@ -222,7 +582,6 @@
 - Fixed a jitter when dismissing the keyboard by scrolling — the input bar now glides down in perfect sync with the keyboard instead of snapping after it closes.
 - Fixed continuous main-thread animation frames competing with the WebContent render during HTML streaming, causing visible lag when JS-heavy content streams in.
 
-
 ## v4.2.2 — May 12, 2026
 
 ### Bug Fixes
@@ -235,7 +594,6 @@
 ### Bug Fixes
 - Fixed update notification popup appearing every time the app launches — once dismissed, it won't reappear for that version; the update icon in the sidebar stays visible so you can tap it anytime.
 - Fixed widgets not rendering properly.
-
 
 ## v4.2 — May 10, 2026
 
@@ -253,7 +611,6 @@
 - Server update sheet now shows the server's favicon as the icon (with a server.rack fallback if unavailable).
 - Fixed conversation tags not appearing — tags were being read from the wrong field in the server response; now correctly reads from the updated server format.
 - Fixed conversation timestamps (created/updated dates) showing the wrong time after loading a chat — the server sends them as integers which weren't being handled correctly.
-
 
 ## v4.1 — May 8, 2026
 
@@ -277,7 +634,6 @@
 - Fixed typing indicator animation
 - Fixed update notice incorrectly triggering based on GitHub tags instead of the actual App Store version.
 
-
 ## v4.0 — May 5, 2026
 
 ### What's New
@@ -293,7 +649,6 @@
 - Fixed nested code blocks rendering as plain text.
 - Fixed citation source icons showing as letter avatars instead of favicons.
 - Known Issue: Inline visualizer plugin is not correctly working with the new re-write and needs a bit more work. Continue using the native visualizer which works perfectly and much better than pluggin. In future, the pluggin support may be dropped as it requires lot of processing since its written for the webui (includes iframe code in the tool block) and causes lag and has no real benifit over the native visualization. 
-
 
 ## v3.5 — May 3, 2026
 
@@ -322,19 +677,16 @@
 - Hidden models (disabled by an admin in OpenWebUI) no longer appear in the model picker or the Default Model setting.
 - Fixed thinking blocks breaking the "Explored N" tool-call grouping on reasoning models — all tool calls now collapse into a single pill as expected.
 
-
 ## v3.4.2 — May 1, 2026
 
 ### Improvements
 - Dramatically improved app's performance while streaming!
-
 
 ## v3.4.1 — April 30, 2026
 
 ### Bug Fixes
 - Fixed streaming responses appearing too fast bypassing the typewriter style.
 - Fixed inline visualizer text flickering and disappearing during live visualization streaming.
-
 
 ## v3.4 — April 30, 2026
 
@@ -356,7 +708,6 @@
 - Fixed quick action pills disappearing from the chat input bar after starting a new chat or switching conversations.
 - Fixed built-in tools (web search, image generation, code interpreter) resetting to their model defaults after sending a message, ignoring any toggles the user had changed.
 
-
 ## v3.3.1 — April 24, 2026
 
 ### Improvements
@@ -365,7 +716,6 @@
 ### Bug Fixes
 - Fixed server-side filter content not appearing in the chat until navigating away and back.
 - Fixed models not able to see image attachments.
-
 
 ## v3.3 — April 24, 2026
 
@@ -388,7 +738,6 @@
 - Fixed message versioning - completely rebuilt end-to-end to match OpenWebUI's conversation tree
 - Attempting to fix Microsoft (and other OAuth) sign-in staying stuck on the web page after successful login instead of returning to the app.
 
-
 ## v3.2.2 — April 21, 2026
 
 ### Improvements
@@ -399,7 +748,6 @@
 - Fixed error messages in chat being truncated — full error text now displays without a line limit.
 - Fixed tapping Photo in the attachment menu returning to the + tools sheet after selecting a photo — the sheet now dismisses immediately when a photo is picked.
 
-
 ## v3.2.1 — April 20, 2026
 
 ### What's New
@@ -407,7 +755,6 @@
 
 ### Bug Fixes
 - Fixed GPS location not using the device's actual GPS — location is now always fresh and includes a full reverse-geocoded address. Also fixed the chat hanging intermittently when location sharing is enabled.
-
 
 ## v3.2 — April 18, 2026
 
@@ -421,7 +768,6 @@
 ### Bug Fixes
 - Fixed tool call status history (web search steps, location resolving, etc.) disappearing when switching chats — status updates now persist correctly when reopening a conversation.
 - Removed further throttling for streaming token by token.
-
 
 ## v3.1 — April 17, 2026
 
@@ -437,12 +783,10 @@
 - Fixed thinking/reasoning block staying expanded after thinking completes — it now collapses automatically once the model finishes reasoning.
 - Fixed profile avatar related issues.
 
-
 ## v3.0.1 — April 15, 2026
 
 ### Bug Fixes
 - Fixed TTS mispronouncing numbers
-
 
 ## v3.0 — April 14, 2026
 
@@ -470,7 +814,6 @@
 - Fixed cloning tools failing due to wrong character in name.
 - Fixed saving workspace items (tools, skills, prompts, models) showing a false "session expired" error.
 
-
 ## v2.6.2 — April 9, 2026
 
 ### Improvements
@@ -479,7 +822,6 @@
 ### Bug Fixes
 - Fixed scrolling to bottom when entering chats.
 - Fixed background notifications not reliably delivering
-
 
 ## v2.6.1 — April 9, 2026
 
@@ -497,8 +839,6 @@
 - Fixed voice call TTS randomly pausing and skipping sentences — the audio pipeline now stays open for the full response instead of tearing down between sentences.
 - Fixed the same response being spoken twice during voice calls — the streaming and speak pipelines no longer overlap.
 - Fixed switching from a voice call to chat read-aloud causing audio glitches — each session now cleanly resets state before starting.
-
-
 
 ## v2.6 — April 9, 2026
 
@@ -520,7 +860,6 @@
 - Fixed pinning a model in model selector would not update the star immediately. 
 - System prompt is now also sent in request params for better compatibility with server-side prompt handling.
 
-
 ## v2.5 — April 7, 2026
 
 ### What's New
@@ -534,7 +873,6 @@
 - Model ID, Prompt command, Skill ID, and Tool ID fields now correctly auto-fill from the name when creating new items in the workspace.
 - Added consistent pill background to the navigation bar model selector chip.
 
-
 ## v2.4.4 — April 7, 2026
 
 ### Improvements
@@ -545,7 +883,6 @@
 ### Bug Fixes
 - Fixed "Send on Enter" not working in channels and thread replies — pressing Enter now sends the message as expected when the setting is enabled.
 - Fixed thread replies appearing twice in the thread view when sent
-
 
 ## v2.4.3 — April 5, 2026
 
@@ -586,7 +923,6 @@
 
 ### Bug Fixes
 - Fixed Shift+Enter not inserting a new line on the first use after app restart on iPad with a hardware keyboard.
-
 
 ## v2.4 — March 31, 2026
 
@@ -739,7 +1075,6 @@
 - Fixed welcome screen prompt cards not appearing on the very first app launch
 - Fixed chats not loading older than a month. Now chats will properly load and match the openwebui grouping.
 - Fixed model and user avatar images showing an infinite loading shimmer on servers using self-signed certificates.
-
 
 ## v1.2.1 — March 18, 2026
 

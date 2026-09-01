@@ -145,6 +145,57 @@ On first launch, enter your Open WebUI server URL and sign in.
 
 ---
 
+## 🔗 URL Scheme
+
+Open Relay supports a custom URL scheme (`openui://`) so you can launch the app and trigger actions from **Raycast, Obsidian, Apple Shortcuts, Home Assistant, terminal scripts**, or any tool that can open a URL.
+
+### Supported URLs
+
+| URL | What it does |
+|---|---|
+| `openui://new-chat` | Open a new chat with focus on the input field |
+| `openui://new-chat?prompt=Hello` | Open a new chat with "Hello" pre-filled in the input |
+| `openui://new-chat?prompt=Hello&send=true` | Open a new chat, pre-fill "Hello", and send it immediately |
+| `openui://new-chat?model=gpt-4o` | Open a new chat and select the specified model |
+| `openui://new-chat?prompt=Hello&model=gpt-4o&send=true` | Pre-fill, select a model, and auto-send |
+| `openui://new-chat?mode=voice-recording` | Start a new AI voice call |
+| `openui://continue` | Resume the last conversation |
+| `openui://chat/{conversationId}` | Open a specific conversation by ID |
+| `openui://voice-call` | Start a voice call |
+| `openui://new-note` | Open the Notes section |
+| `openui://new-channel` | Create a new Channel |
+| `openui://note/{noteId}` | Open a specific note by ID |
+
+### Query Parameters
+
+| Parameter | Values | Description |
+|---|---|---|
+| `prompt` | Any text (max 4,000 chars) | Pre-fills the chat input field |
+| `model` | Model ID string | Selects the model by ID (e.g. `gpt-4o`, `llama3.2`) |
+| `send` | `true` | Auto-sends the prompt immediately (requires `prompt`) |
+| `mode` | `voice-recording` | Opens a voice call instead of text chat |
+
+### Examples
+
+**Raycast Script Command:**
+```bash
+open "openui://new-chat?prompt=Summarize%20my%20clipboard&send=true"
+```
+
+**Apple Shortcut action:**
+Use the built-in **"Ask Open Relay"** Shortcuts action (appears in the Shortcuts app under Open Relay) to open a chat with a prompt, optional model, and auto-send — all configurable from the Shortcuts editor.
+
+**Home Assistant automation:**
+```yaml
+service: notify.mobile_app_your_phone
+data:
+  message: "shortcut"
+  data:
+    url: "openui://new-chat?prompt=What%27s+the+weather+forecast%3F&send=true"
+```
+
+---
+
 ## 🤝 Contributing
 
 Pull requests are welcome! Whether it's a bug fix, improvement, or new feature — feel free to open an issue or submit a PR.

@@ -46,6 +46,7 @@ final class KeychainService: Sendable {
     }
 
     /// Retrieves the JWT token for the given server URL.
+    /// Returns the raw stored token string. Token validity is determined by the server (401 response).
     func getToken(forServer serverURL: String) -> String? {
         let account = accountKey(for: serverURL)
 
@@ -115,6 +116,7 @@ final class KeychainService: Sendable {
     }
 
     /// Retrieves the JWT token for a specific user account on a server.
+    /// Returns the raw stored token string. Token validity is determined by the server (401 response).
     func getToken(forServer serverURL: String, userId: String) -> String? {
         let account = accountKey(for: serverURL, userId: userId)
 
@@ -324,4 +326,5 @@ final class KeychainService: Sendable {
             .lowercased()
             .replacingOccurrences(of: "/$", with: "", options: .regularExpression)
     }
+
 }

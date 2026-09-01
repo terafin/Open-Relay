@@ -2,14 +2,18 @@ import SwiftUI
 
 // MARK: - iPad Main Chat View
 //
-// Purpose-built split-column layout for iPad using NavigationSplitView.
-// - Sidebar (Column 1, ~300pt): Persistent conversation list + folders — always visible.
-// - Detail (Column 2): ChatDetailView — fills remaining space with max reading width.
-// - Optional trailing column: TerminalBrowserView when terminal is active.
+// Supports two layout modes controlled by the "ipad_sidebar_always_shown" AppStorage key:
 //
-// iPhone uses MainChatView (unchanged). This view is only shown when
-// horizontalSizeClass == .regular (iPad, or iPhone in landscape with a keyboard
-// connected if it reports regular).
+// • Auto-hide (default): iPhone-style slide-out drawer — identical push/scale/blur
+//   behaviour to MainChatView. The sidebar slides in from the left and pushes the
+//   content card right, with scale/blur/corner-radius animation.
+//
+// • Always shown: Split-view layout — sidebar is a fixed left column (drawerWidth)
+//   and the chat content fills the remaining space. No overlay, no push animation.
+//   The hamburger button in ChatDetailView is hidden since there's no drawer to open.
+//
+// The preference is toggled from Settings → Appearance (iPad only) and persists
+// across app restarts via AppStorage.
 
 struct iPadMainChatView: View {
     @Environment(AppDependencyContainer.self) private var dependencies
@@ -53,8 +57,17 @@ struct iPadMainChatView: View {
     /// Controls the My Defaults sheet presentation.
     @State private var showUserSettings = false
 
-    /// Controls column visibility for the NavigationSplitView.
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    /// Controls the drawer visibility (mirrors MainChatView).
+    @State private var showDrawer = false
+
+    /// Live drag offset for interactive drawer sliding.
+    @State private var dragOffset: CGFloat = 0
+
+    /// Whether a drawer drag is in progress (prevents animation fighting).
+    @State private var isDraggingDrawer = false
+
+    /// Cached container width from GeometryReader (avoids deprecated UIScreen.main).
+    @State private var containerWidth: CGFloat = 768
 
     /// Whether socket reconnect handler has been registered.
     @State private var hasRegisteredSocketHandlers = false
@@ -65,6 +78,11 @@ struct iPadMainChatView: View {
     /// When set, the detail area shows a folder workspace view so new chats
     /// are created inside this folder (mirrors MainChatView behaviour).
     @State private var activeFolderWorkspaceId: String?
+
+    /// The folder object for the current workspace — captured synchronously at
+    /// selection time so the background image is available on the FIRST render,
+    /// before `setActiveFolder`'s async detail fetch completes.
+    @State private var activeFolderForWorkspace: ChatFolder?
 
     /// Channel list view model for sidebar display.
     @State private var channelListVM = ChannelListViewModel()
@@ -81,6 +99,12 @@ struct iPadMainChatView: View {
     /// Controls the admin console sheet presentation (admin users only).
     @State private var showAdminConsole = false
 
+    /// Controls the on-device TTS model download sheet before entering a voice call.
+    @State private var showModelDownloadSheet = false
+
+    /// Stores the voice call action to fire once the model finishes downloading.
+    @State private var pendingVoiceCallAction: (() -> Void)?
+
     /// Rename conversation state.
     @State private var renamingConversation: Conversation?
     @State private var renameText = ""
@@ -91,6 +115,11 @@ struct iPadMainChatView: View {
     @State private var showExportShareSheet = false
     @State private var isExporting = false
     @State private var exportError: String?
+
+    // MARK: Photo picker (window-level)
+    // Owned here so AnimatedPhotoPicker renders outside ChatDetailView's
+    // safeAreaInset-shrunk ZStack and can truly cover the full screen.
+    @State private var showAnimatedPhotoPicker = false
 
     /// Share chat sheet state.
     @State private var sharingConversation: Conversation?
@@ -109,18 +138,57 @@ struct iPadMainChatView: View {
     /// Whether the terminal file browser panel is visible (independent of terminal being enabled).
     @State private var showTerminalBrowser: Bool = true
 
+    // MARK: - Sidebar Layout Preference (iPad-only)
+
+    /// When `true`, the sidebar is shown as a persistent left column instead of a slide-out drawer.
+    /// Persisted via AppStorage so the preference survives app restarts.
+    @AppStorage("ipad_sidebar_always_shown") private var sidebarAlwaysShown: Bool = false
+
+    /// In always-shown mode, tracks whether the user has the sidebar column visible.
+    /// Starts open but can be collapsed/expanded independently of the setting.
+    @State private var splitSidebarVisible: Bool = true
+
+    /// Live drag offset for the terminal browser trailing-edge swipe in always-shown mode.
+    @State private var terminalDragOffset: CGFloat = 0
+    /// Whether a terminal drag is in progress in always-shown mode.
+    @State private var isDraggingTerminal: Bool = false
+
+    // MARK: - Drawer Geometry (mirrors MainChatView)
+
+    /// Drawer width — wider on iPad for comfortable reading (capped at 360pt).
+    private var drawerWidth: CGFloat {
+        min(containerWidth * 0.40, 360)
+    }
+
+    /// Effective drawer X offset (0 = fully open, -drawerWidth = fully closed).
+    private var effectiveDrawerX: CGFloat {
+        let base: CGFloat = showDrawer ? 0 : -drawerWidth
+        let combined = base + dragOffset
+        return min(0, max(-drawerWidth, combined))
+    }
+
+    /// Open fraction 0→1 — drives push animation on main content.
+    private var drawerFraction: CGFloat {
+        let fraction = (effectiveDrawerX + drawerWidth) / drawerWidth
+        return min(1, max(0, fraction))
+    }
+
+    /// How far the main content card is pushed right.
+    private var mainContentOffset: CGFloat { drawerFraction * drawerWidth }
+
     // MARK: - Body
 
     var body: some View {
         @Bindable var bindableRouter = router
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            sidebarContent
-                .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 360)
-        } detail: {
-            detailContent(voiceCallBinding: $bindableRouter.isVoiceCallPresented)
-        }
-        .navigationSplitViewStyle(.balanced)
-        .applySheets(
+        rootLayout(voiceCallBinding: $bindableRouter.isVoiceCallPresented)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.width
+            } action: { newWidth in
+                if abs(containerWidth - newWidth) > 1 {
+                    containerWidth = newWidth
+                }
+            }
+            .applySheets(
             showSettings: $showSettings,
             showNotes: $showNotes,
             showCreateFolderSheet: $showCreateFolderSheet,
@@ -173,6 +241,13 @@ struct iPadMainChatView: View {
             showExportShareSheet: $showExportShareSheet,
             onSocketSetup: { registerSocketReconnectHandler() }
         )
+        // Reset drag state on background (prevents stale offset blocking hits on foreground)
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .active {
+                dragOffset = 0
+                isDraggingDrawer = false
+            }
+        }
         // Terminal WebSocket lifecycle — disconnect on background, reconnect on foreground
         .onChange(of: scenePhase) { oldPhase, newPhase in
             if newPhase == .active && oldPhase != .active {
@@ -227,7 +302,13 @@ struct iPadMainChatView: View {
                     modelName: modelName
                 )
             }
-            router.presentVoiceCall(viewModel: voiceCallVM)
+            // Intercept: show download sheet if on-device model not yet ready
+            if dependencies.textToSpeechService.needsOnDeviceModelDownload {
+                pendingVoiceCallAction = { router.presentVoiceCall(viewModel: voiceCallVM) }
+                showModelDownloadSheet = true
+            } else {
+                router.presentVoiceCall(viewModel: voiceCallVM)
+            }
         }
         .onChange(of: activeChannelId) { _, newId in
             // When entering a channel, the server marks it as read via GET /channels/{id}.
@@ -330,6 +411,12 @@ struct iPadMainChatView: View {
                 .environment(dependencies)
                 .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
         }
+        // On-device TTS model download sheet (shown before voice call when model not yet ready)
+        .sheet(isPresented: $showModelDownloadSheet, onDismiss: {
+            pendingVoiceCallAction = nil
+        }) {
+            modelDownloadSheetContent()
+        }
         .overlay {
             if isExporting {
                 exportingOverlay
@@ -340,9 +427,303 @@ struct iPadMainChatView: View {
         }
     }
 
-    // MARK: - Sidebar
+    // MARK: - Root Layout — branches between always-shown split and auto-hide drawer
 
-    private var sidebarContent: some View {
+    @ViewBuilder
+    private func rootLayout(voiceCallBinding: Binding<Bool>) -> some View {
+        if sidebarAlwaysShown {
+            alwaysShownSplitLayout(voiceCallBinding: voiceCallBinding)
+        } else {
+            mainZStack(voiceCallBinding: voiceCallBinding)
+        }
+    }
+
+    // MARK: - Always-Shown Split Layout
+
+    /// Persistent split layout: collapsible sidebar column on the left, chat detail fills the rest.
+    /// The terminal browser overlays from the trailing edge (same as auto-hide mode).
+    /// The sidebar can be hidden/shown by the user independently of the always-shown setting.
+    @ViewBuilder
+    private func alwaysShownSplitLayout(voiceCallBinding: Binding<Bool>) -> some View {
+        ZStack(alignment: .leading) {
+            HStack(spacing: 0) {
+                // Sidebar column — animated in/out
+                if splitSidebarVisible {
+                    NavigationStack {
+                        drawerPanel
+                    }
+                    .frame(width: drawerWidth)
+                    .overlay(alignment: .trailing) {
+                        Rectangle()
+                            .fill(theme.textTertiary.opacity(0.15))
+                            .frame(width: 0.5)
+                            .ignoresSafeArea()
+                    }
+                    .transition(.move(edge: .leading))
+                }
+
+                // Chat/channel detail with terminal overlay
+                ZStack(alignment: .trailing) {
+                    NavigationStack {
+                        chatDetailContent
+                            .navigationBarTitleDisplayMode(.inline)
+                            .toolbarBackground(.hidden, for: .navigationBar)
+                    }
+                    .ignoresSafeArea(.keyboard, edges: .bottom)
+                    .frame(maxWidth: .infinity)
+
+                    // Terminal browser — slide-in overlay from trailing edge
+                    if isTerminalActiveInCurrentChat && showTerminalBrowser {
+                        HStack(spacing: 0) {
+                            Spacer()
+                            TerminalBrowserView(
+                                viewModel: terminalBrowserVM,
+                                onDismiss: {
+                                    withAnimation(MicroAnimation.panelClose) {
+                                        showTerminalBrowser = false
+                                        terminalDragOffset = 0
+                                    }
+                                    terminalBrowserVM.handlePanelClosed()
+                                }
+                            )
+                            .frame(width: 340)
+                            .background(theme.background)
+                            .shadow(color: .black.opacity(0.12), radius: 16, x: -4)
+                            .offset(x: max(0, terminalDragOffset))
+                            .gesture(
+                                DragGesture(minimumDistance: 12, coordinateSpace: .local)
+                                    .onChanged { value in
+                                        let h = value.translation.width
+                                        guard h > 0 else { return }
+                                        isDraggingTerminal = true
+                                        terminalDragOffset = h
+                                    }
+                                    .onEnded { value in
+                                        guard isDraggingTerminal else { return }
+                                        isDraggingTerminal = false
+                                        let h = value.translation.width
+                                        let v = value.velocity.width
+                                        if h > 100 || v > 400 {
+                                            withAnimation(MicroAnimation.panelClose) {
+                                                showTerminalBrowser = false
+                                                terminalDragOffset = 0
+                                            }
+                                            terminalBrowserVM.handlePanelClosed()
+                                        } else {
+                                            withAnimation(MicroAnimation.panelClose) {
+                                                terminalDragOffset = 0
+                                            }
+                                        }
+                                    }
+                            )
+                            .onAppear {
+                                configureTerminalBrowserIfNeeded()
+                                terminalBrowserVM.handlePanelOpened()
+                                terminalBrowserVM.refresh()
+                            }
+                        }
+                        .transition(.move(edge: .trailing))
+                        .ignoresSafeArea(.keyboard)
+                    }
+
+                    // Right-edge strip — swipe left-to-right to open terminal (when terminal active and panel hidden)
+                    if isTerminalActiveInCurrentChat && !showTerminalBrowser {
+                        Color.clear
+                            .frame(width: 44)
+                            .frame(maxHeight: .infinity)
+                            .contentShape(Rectangle())
+                            .gesture(
+                                DragGesture(minimumDistance: 8, coordinateSpace: .local)
+                                    .onChanged { value in
+                                        let h = value.translation.width
+                                        let v = abs(value.translation.height)
+                                        guard abs(h) > v, h < 0 else { return }
+                                        isDraggingTerminal = true
+                                        terminalDragOffset = 340 + h // start off-screen, slide in
+                                    }
+                                    .onEnded { value in
+                                        guard isDraggingTerminal else { return }
+                                        isDraggingTerminal = false
+                                        let h = value.translation.width
+                                        let vel = value.velocity.width
+                                        if h < -60 || vel < -300 {
+                                            withAnimation(MicroAnimation.panelOpen) {
+                                                showTerminalBrowser = true
+                                                terminalDragOffset = 0
+                                            }
+                                            configureTerminalBrowserIfNeeded()
+                                            terminalBrowserVM.handlePanelOpened()
+                                            terminalBrowserVM.refresh()
+                                            Haptics.play(.light)
+                                        } else {
+                                            withAnimation(MicroAnimation.panelClose) {
+                                                terminalDragOffset = 0
+                                            }
+                                        }
+                                    }
+                            )
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                    }
+                }
+            }
+            .animation(MicroAnimation.panelOpen, value: splitSidebarVisible)
+
+        }
+        // When switching TO always-shown, make sure the drawer state is clean
+        .onAppear {
+            showDrawer = false
+            dragOffset = 0
+            isDraggingDrawer = false
+            terminalDragOffset = 0
+            isDraggingTerminal = false
+        }
+    }
+
+    // MARK: - Main ZStack (auto-hide drawer layout — mirrors MainChatView)
+
+    @ViewBuilder
+    private func mainZStack(voiceCallBinding: Binding<Bool>) -> some View {
+        ZStack(alignment: .leading) {
+            // MARK: Main content — pushed right as drawer opens
+            NavigationStack {
+                detailContent(voiceCallBinding: voiceCallBinding)
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbarBackground(.hidden, for: .navigationBar)
+            }
+            .ignoresSafeArea(.keyboard, edges: .bottom)
+            .offset(x: mainContentOffset)
+            .scaleEffect(1.0 - (drawerFraction * 0.08), anchor: .center)
+            .clipShape(RoundedRectangle(cornerRadius: drawerFraction * 16, style: .continuous))
+            .blur(radius: drawerFraction * 8)
+            .shadow(color: .black.opacity(0.18 * drawerFraction), radius: 20, x: -4)
+            .overlay {
+                Color.black
+                    .opacity(0.12 * drawerFraction)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
+            // Tap or swipe-left to close when drawer is open
+            .overlay {
+                if drawerFraction > 0.01 || isDraggingDrawer {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture { closeDrawerAnimated() }
+                        .gesture(
+                            DragGesture(minimumDistance: 12, coordinateSpace: .local)
+                                .onChanged { value in
+                                    let h = value.translation.width
+                                    guard h < 0 else { return }
+                                    isDraggingDrawer = true
+                                    dragOffset = h
+                                }
+                                .onEnded { value in
+                                    guard isDraggingDrawer else { return }
+                                    isDraggingDrawer = false
+                                    let h = value.translation.width
+                                    let v = value.velocity.width
+                                    if h < -(drawerWidth * 0.15) || v < -300 {
+                                        closeDrawerAnimated()
+                                    } else {
+                                        openDrawerAnimated()
+                                    }
+                                }
+                        )
+                }
+            }
+
+            // MARK: Drawer panel
+            drawerPanel
+                .frame(width: drawerWidth)
+                .offset(x: effectiveDrawerX)
+                .accessibilityHidden(drawerFraction < 0.01)
+                .gesture(
+                    DragGesture(minimumDistance: 12, coordinateSpace: .local)
+                        .onChanged { value in
+                            let h = value.translation.width
+                            guard h < 0 else { return }
+                            isDraggingDrawer = true
+                            dragOffset = h
+                        }
+                        .onEnded { value in
+                            guard isDraggingDrawer else { return }
+                            isDraggingDrawer = false
+                            let h = value.translation.width
+                            let v = value.velocity.width
+                            if h < -(drawerWidth * 0.15) || v < -300 {
+                                closeDrawerAnimated()
+                            } else {
+                                openDrawerAnimated()
+                            }
+                        }
+                )
+
+            // MARK: Left-edge strip — swipe right to open (when drawer is closed)
+            // Note: do NOT hide this based on isDraggingDrawer — removing it mid-gesture
+            // cancels the DragGesture before onEnded fires, causing the drawer to open only ~5%.
+            //
+            // The strip is offset below the navigation bar (≈60pt for status bar + nav bar)
+            // so it does NOT intercept taps on the hamburger button in the toolbar. Without
+            // this offset the clear+contentShape layer sits on top of the toolbar and swallows
+            // taps before the Button underneath can fire.
+            if !showDrawer {
+                Color.clear
+                    .frame(width: 44)
+                    .frame(maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 8, coordinateSpace: .local)
+                            .onChanged { value in
+                                let h = value.translation.width
+                                let v = abs(value.translation.height)
+                                guard abs(h) > v, h > 0 else { return }
+                                if !isDraggingDrawer {
+                                    UIApplication.shared.sendAction(
+                                        #selector(UIResponder.resignFirstResponder),
+                                        to: nil, from: nil, for: nil)
+                                }
+                                isDraggingDrawer = true
+                                dragOffset = h
+                            }
+                            .onEnded { value in
+                                guard isDraggingDrawer else { return }
+                                isDraggingDrawer = false
+                                let h = value.translation.width
+                                let v = value.velocity.width
+                                // Low threshold so even a short flick commits the open
+                                if h > drawerWidth * 0.05 || v > 200 {
+                                    openDrawerAnimated()
+                                } else {
+                                    closeDrawerAnimated()
+                                }
+                            }
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    // Offset below the status bar + navigation bar so the clear hit-test
+                    // area does not block the hamburger button in the toolbar (~60pt).
+                    .padding(.top, 60)
+            }
+
+            // ── Layer 4: AnimatedPhotoPicker at window level ──────────────────
+            AnimatedPhotoPicker(
+                isPresented: showAnimatedPhotoPicker,
+                onConfirm: { assets in
+                    NotificationCenter.default.post(
+                        name: .openUIPhotoPickerConfirm,
+                        object: nil,
+                        userInfo: ["assets": assets]
+                    )
+                    showAnimatedPhotoPicker = false
+                },
+                onDismiss: {
+                    showAnimatedPhotoPicker = false
+                }
+            )
+        }
+    }
+
+    // MARK: - Drawer Panel
+
+    private var drawerPanel: some View {
         iPadSidebarContent(
             listViewModel: listViewModel,
             channelListVM: channelListVM,
@@ -367,21 +748,84 @@ struct iPadMainChatView: View {
             renamingConversation: $renamingConversation,
             renameText: $renameText,
             dependencies: dependencies,
-            onNewChat: { startNewChat() },
+            onNewChat: {
+                startNewChat()
+                if !sidebarAlwaysShown { closeDrawerAnimated() }
+            },
             onSelectFolder: { folderId in
                 let folderVM = listViewModel.folderViewModel
-                Task { await folderVM.setActiveFolder(folderId) }
-                // Reset the new-chat VM so the folder workspace always starts fresh.
-                dependencies.activeChatStore.remove(nil)
-                newChatGeneration += 1
                 activeFolderWorkspaceId = folderId
                 activeConversationId = nil
                 activeChannelId = nil
+                dependencies.activeChatStore.remove(nil)
+                newChatGeneration += 1
+                // Set immediate placeholder from the flat list (may lack meta)
+                activeFolderForWorkspace = folderVM.folders.first { $0.id == folderId }
+                Task {
+                    // Fetch full detail (background image URL, system prompt, models)
+                    await folderVM.setActiveFolder(folderId)
+                    // Pre-warm the folder background image so ChatDetailView has
+                    // an instant cache hit and shows no layout shift.
+                    if let bgUrl = folderVM.activeFolderDetail?.backgroundImageUrl,
+                       !bgUrl.isEmpty, !bgUrl.hasPrefix("data:"),
+                       let api = dependencies.apiClient {
+                        let resolvedURL: URL?
+                        if bgUrl.hasPrefix("http") {
+                            resolvedURL = URL(string: bgUrl)
+                        } else {
+                            resolvedURL = URL(string: api.baseURL + bgUrl)
+                        }
+                        if let imgURL = resolvedURL {
+                            Task(priority: .userInitiated) {
+                                _ = await ImageCacheService.shared.loadImage(
+                                    from: imgURL,
+                                    authToken: api.network.authToken,
+                                    targetPixelSize: Int(UIScreen.main.bounds.width * UIScreen.main.scale)
+                                )
+                            }
+                        }
+                    }
+                    // Load chats — they're fetched lazily and may be empty
+                    // if the folder was never expanded in the sidebar.
+                    if var flatFolder = folderVM.folders.first(where: { $0.id == folderId }) {
+                        flatFolder.isExpanded = true   // satisfy the isExpanded guard in loadChatsIfNeeded
+                        await folderVM.loadChatsIfNeeded(for: flatFolder)
+                    }
+                    // Merge: full detail has meta/background, flat list now has chats
+                    if let detail = folderVM.activeFolderDetail {
+                        var merged = detail
+                        if merged.chats.isEmpty,
+                           let flatFolder = folderVM.folders.first(where: { $0.id == folderId }),
+                           !flatFolder.chats.isEmpty {
+                            merged.chats = flatFolder.chats
+                        }
+                        activeFolderForWorkspace = merged
+                    }
+                }
+                if !sidebarAlwaysShown { closeDrawerAnimated() }
             },
             onExport: { conv, format in Task { await exportChat(conv, format: format) } },
             onShowArchivedChats: { showArchivedChats = true },
-            onShowSharedChats: { showSharedChats = true }
+            onShowSharedChats: { showSharedChats = true },
+            onCloseDrawer: sidebarAlwaysShown ? nil : { closeDrawerAnimated() }
         )
+    }
+
+    // MARK: - Drawer Animations
+
+    private func openDrawerAnimated() {
+        withAnimation(MicroAnimation.panelOpen) {
+            showDrawer = true
+            dragOffset = 0
+        }
+        Haptics.play(.light)
+    }
+
+    private func closeDrawerAnimated() {
+        withAnimation(MicroAnimation.panelClose) {
+            showDrawer = false
+            dragOffset = 0
+        }
     }
 
     // MARK: - Detail
@@ -400,10 +844,10 @@ struct iPadMainChatView: View {
                     TerminalBrowserView(
                         viewModel: terminalBrowserVM,
                         onDismiss: {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                                showTerminalBrowser = false
-                            }
-                            terminalBrowserVM.handlePanelClosed()
+                        withAnimation(MicroAnimation.panelClose) {
+                            showTerminalBrowser = false
+                        }
+                        terminalBrowserVM.handlePanelClosed()
                         }
                     )
                     .frame(width: 340)
@@ -422,7 +866,7 @@ struct iPadMainChatView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                        withAnimation(showTerminalBrowser ? MicroAnimation.panelClose : MicroAnimation.panelOpen) {
                             if showTerminalBrowser {
                                 showTerminalBrowser = false
                                 terminalBrowserVM.handlePanelClosed()
@@ -451,43 +895,47 @@ struct iPadMainChatView: View {
 
     @ViewBuilder
     private var chatDetailContent: some View {
+        // In auto-hide mode: hamburger opens the drawer.
+        // In always-shown mode: hamburger toggles the sidebar column (hide/show).
+        let toggleDrawerAction: () -> Void = sidebarAlwaysShown
+            ? {
+                withAnimation(splitSidebarVisible ? MicroAnimation.panelClose : MicroAnimation.panelOpen) {
+                    splitSidebarVisible.toggle()
+                }
+                Haptics.play(.light)
+            }
+            : { openDrawerAnimated() }
+
         if let channelId = activeChannelId {
             ChannelDetailView(channelId: channelId, channelListVM: channelListVM)
+                .onToggleDrawer(toggleDrawerAction)
                 .id("channel-\(channelId)")
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button { startNewChat() } label: {
-                            Image(systemName: "square.and.pencil")
-                                .scaledFont(size: 14, weight: .medium)
-                                .foregroundStyle(theme.textSecondary)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("New Chat")
-                    }
-                }
         } else if let conversationId = activeConversationId {
+            // If this conversation belongs to the active folder workspace, pass the folder
+            // so the background image and folder context persists while viewing the chat.
+            let folderForConversation: ChatFolder? = {
+                guard let fwId = activeFolderWorkspaceId else { return nil }
+                return listViewModel.folderViewModel.folders.first { $0.id == fwId }
+                    ?? listViewModel.folderViewModel.activeFolderDetail
+            }()
             ChatDetailView(
                 conversationId: conversationId,
-                viewModel: dependencies.activeChatStore.viewModel(for: conversationId)
+                viewModel: dependencies.activeChatStore.viewModel(for: conversationId),
+                folderWorkspace: folderForConversation
             )
             .onDeleteChat { startNewChat() }
+            .onNewChat { startNewChat() }
+            .onToggleDrawer(toggleDrawerAction)
+            .onPhotoPickerRequest { showAnimatedPhotoPicker = true }
             .id(conversationId)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { startNewChat() } label: {
-                        Image(systemName: "square.and.pencil")
-                            .scaledFont(size: 14, weight: .medium)
-                            .foregroundStyle(theme.textSecondary)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("New Chat")
-                }
-            }
         } else if let folderWorkspaceId = activeFolderWorkspaceId {
             let vm = dependencies.activeChatStore.viewModel(for: nil)
             let folder = listViewModel.folderViewModel.folders.first { $0.id == folderWorkspaceId }
                 ?? listViewModel.folderViewModel.activeFolderDetail
             ChatDetailView(viewModel: vm, folderWorkspace: folder)
+                .onNewChat { startNewChat() }
+                .onToggleDrawer(toggleDrawerAction)
+                .onPhotoPickerRequest { showAnimatedPhotoPicker = true }
                 .id("folder-workspace-\(folderWorkspaceId)-\(newChatGeneration)")
                 .onAppear {
                     let folderDetail = listViewModel.folderViewModel.activeFolderDetail
@@ -497,32 +945,26 @@ struct iPadMainChatView: View {
                         modelIds: folderDetail?.modelIds ?? folder?.modelIds ?? []
                     )
                 }
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button { startNewChat() } label: {
-                            Image(systemName: "square.and.pencil")
-                                .scaledFont(size: 14, weight: .medium)
-                                .foregroundStyle(theme.textSecondary)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("New Chat")
-                    }
-                }
         } else {
             ChatDetailView(viewModel: dependencies.activeChatStore.viewModel(for: nil))
+                .onNewChat { startNewChat() }
+                .onToggleDrawer(toggleDrawerAction)
+                .onPhotoPickerRequest { showAnimatedPhotoPicker = true }
                 .id("new-chat-\(newChatGeneration)")
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button { startNewChat() } label: {
-                            Image(systemName: "square.and.pencil")
-                                .scaledFont(size: 14, weight: .medium)
-                                .foregroundStyle(theme.textSecondary)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("New Chat")
-                    }
-                }
         }
+    }
+
+    /// Hamburger button that opens the sidebar drawer — placed in each detail view's toolbar.
+    private var sidebarButton: some View {
+        Button {
+            openDrawerAnimated()
+        } label: {
+            Image(systemName: "sidebar.left")
+                .scaledFont(size: 14, weight: .medium)
+                .foregroundStyle(theme.textSecondary)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Open Sidebar")
     }
 
     // MARK: - Overlays
@@ -540,6 +982,29 @@ struct iPadMainChatView: View {
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
         }
         .transition(.opacity)
+    }
+
+    // MARK: - Model Download Sheet Content (extracted to avoid type-check timeout)
+    @ViewBuilder
+    private func modelDownloadSheetContent() -> some View {
+        VoiceCallModelDownloadSheet(
+            ttsService: dependencies.textToSpeechService,
+            onReady: {
+                showModelDownloadSheet = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    pendingVoiceCallAction?()
+                    pendingVoiceCallAction = nil
+                }
+            },
+            onCancel: {
+                showModelDownloadSheet = false
+                pendingVoiceCallAction = nil
+            }
+        )
+        .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+        .presentationDetents([.height(420)])
+        .presentationDragIndicator(.hidden)
+        .presentationCornerRadius(24)
     }
 
     private var deletingOverlay: some View {
@@ -576,30 +1041,31 @@ struct iPadMainChatView: View {
     // MARK: - Actions
 
     private func startNewChat() {
-        // If we're already on the new-chat screen AND a transcription is in
-        // progress, stay put — destroying the VM would silently discard the work.
-        let alreadyOnNewChat = activeConversationId == nil && activeChannelId == nil
         let currentNewVM = dependencies.activeChatStore.viewModel(for: nil)
-        if alreadyOnNewChat && currentNewVM.hasActiveTranscriptions {
+
+        // If a transcription is running on the new-chat VM, stay put regardless
+        // of whether we're already on the new-chat screen.
+        if currentNewVM.hasActiveTranscriptions {
             return
         }
 
-        // Only remove + recreate the VM when there's no ongoing transcription work.
-        let shouldRecreateVM = !currentNewVM.hasActiveTranscriptions
-        if shouldRecreateVM {
+        // The navbar "new chat" button always navigates to a plain new chat —
+        // never inside a folder workspace, regardless of the current context.
+        // Always remove + recreate the VM so derived state (random prompt cards,
+        // terminal status, model avatar, etc.) refreshes correctly. The view
+        // identity bump (.id change) is what drives those @State resets.
+        // All state mutations are wrapped in a non-animating transaction so the
+        // swap is an instant replacement with no slide/fade animation.
+        var txn = Transaction()
+        txn.disablesAnimations = true
+        withTransaction(txn) {
             dependencies.activeChatStore.remove(nil)
-        }
-
-        // Keep ALL state mutations in one withAnimation pass so SwiftUI
-        // performs a single animated view-identity transition (no flash/revert).
-        withAnimation(.easeInOut(duration: 0.2)) {
             activeConversationId = nil
             activeChannelId = nil
             activeFolderWorkspaceId = nil
-            if shouldRecreateVM {
-                newChatGeneration += 1
-            }
+            newChatGeneration += 1
         }
+
         // Clear the persisted last-active conversation so a cold launch after
         // this explicit new-chat navigation does not restore the old chat.
         SharedDataService.shared.saveLastActiveConversationId(nil)
@@ -734,14 +1200,22 @@ struct iPadSidebarContent: View {
     let onExport: (Conversation, iPadMainChatView.ExportFormat) -> Void
     var onShowArchivedChats: (() -> Void)? = nil
     var onShowSharedChats: (() -> Void)? = nil
+    /// Called when a conversation/channel is selected — closes the drawer on iPad.
+    var onCloseDrawer: (() -> Void)? = nil
 
     @Environment(\.theme) private var theme
     @State private var drawerChatsDropActive = false
     @State private var showMoveSelectedToFolderSheet = false
     @State private var showUpdateSheet = false
 
+    /// Controls the on-device TTS model download sheet shown before opening a voice call.
+    @State private var showModelDownloadSheet = false
+    /// Pending voice call action stored while the model download sheet is visible.
+    @State private var pendingVoiceCallAction: (() -> Void)?
+
     /// Top-level section collapse states (shared with iPhone via same AppStorage keys).
     @AppStorage("sidebar_folders_expanded") private var foldersExpanded: Bool = true
+    @AppStorage("sidebar_shared_folders_expanded") private var sharedFoldersExpanded: Bool = true
     @AppStorage("sidebar_channels_expanded") private var channelsExpanded: Bool = true
     @AppStorage("sidebar_chats_expanded") private var chatsExpanded: Bool = true
     /// Tracks which time-group sub-sections are collapsed (e.g. "Pinned", "Today").
@@ -763,7 +1237,7 @@ struct iPadSidebarContent: View {
             if listViewModel.isSelectionMode {
                 selectionModeHeader
             } else {
-                sidebarSearchBar
+                sidebarHeader
             }
 
             // Conversation list
@@ -780,15 +1254,16 @@ struct iPadSidebarContent: View {
                         foldersSection(folderVM: folderVM)
                     }
 
+                    // Shared with me section
+                    if foldersEnabled && !folderVM.sharedFolders.isEmpty {
+                        sharedFoldersSection(folderVM: folderVM)
+                    }
+
                     // Divider between folders and channels
                     let channelsEnabled = dependencies.authViewModel.featurePermissions.channels
                         && (dependencies.authViewModel.backendConfig?.features?.enableChannels ?? true)
                     if (foldersEnabled && !folderVM.featureDisabled && !folderVM.folders.isEmpty) || (channelsEnabled && !channelListVM.channels.isEmpty) {
-                        Rectangle()
-                            .fill(theme.textTertiary.opacity(0.12))
-                            .frame(height: 1)
-                            .padding(.horizontal, Spacing.md)
-                            .padding(.vertical, Spacing.sm)
+                        sidebarDivider
                     }
 
                     // Channels section (shown only when enabled on server)
@@ -798,11 +1273,7 @@ struct iPadSidebarContent: View {
 
                     // Divider between channels and chats
                     if channelsEnabled && !channelListVM.channels.isEmpty {
-                        Rectangle()
-                            .fill(theme.textTertiary.opacity(0.12))
-                            .frame(height: 1)
-                            .padding(.horizontal, Spacing.md)
-                            .padding(.vertical, Spacing.sm)
+                        sidebarDivider
                     }
 
                     // Chats section
@@ -823,6 +1294,12 @@ struct iPadSidebarContent: View {
             }
         }
         .background(theme.background)
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(theme.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.08))
+                .frame(width: 0.5)
+                .ignoresSafeArea()
+        }
         // Sidebar has no text inputs that need keyboard avoidance — ignore
         // keyboard safe area so the sidebar layout doesn't shift when a
         // floating keyboard appears/disappears or changes size on iPad.
@@ -901,35 +1378,189 @@ struct iPadSidebarContent: View {
         .toolbarBackground(.hidden, for: .navigationBar)
     }
 
-    // MARK: - Search Bar
+    // MARK: - Sidebar Header (New Elegant Design)
 
-    private var sidebarSearchBar: some View {
-        HStack(spacing: Spacing.sm) {
+    private var sidebarHeader: some View {
+        VStack(spacing: 0) {
+            // Top row: avatar/name + action buttons
+            HStack(spacing: 8) {
+                // User avatar — tap → Settings, long-press → Account Picker
+                ZStack(alignment: .bottomTrailing) {
+                    UserAvatar(
+                        size: 34,
+                        imageURL: {
+                            guard let userId = dependencies.authViewModel.currentUser?.id,
+                                  let baseURL = dependencies.apiClient?.baseURL,
+                                  !userId.isEmpty, !baseURL.isEmpty else { return nil }
+                            let v = dependencies.authViewModel.profileImageVersion
+                            return URL(string: "\(baseURL)/api/v1/users/\(userId)/profile/image?v=\(v)")
+                        }(),
+                        name: dependencies.authViewModel.currentUser?.displayName ?? "User",
+                        authToken: dependencies.apiClient?.network.authToken,
+                        dataURIString: dependencies.authViewModel.currentUser?.profileImageURL
+                    )
+                    Circle()
+                        .fill(Color.green)
+                        .frame(width: 9, height: 9)
+                        .overlay(Circle().stroke(theme.sidebarBackground, lineWidth: 1.5))
+                        .offset(x: 2, y: 2)
+                }
+                .contentShape(Rectangle())
+                .onLongPressGesture(minimumDuration: 0.5) {
+                    Haptics.play(.medium)
+                    dependencies.authViewModel.showAccountPicker = true
+                }
+                .simultaneousGesture(TapGesture().onEnded {
+                    showSettings = true
+                })
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(dependencies.authViewModel.currentUser?.displayName ?? "User")
+                        .scaledFont(size: 14, weight: .semibold)
+                        .foregroundStyle(theme.textPrimary)
+                        .lineLimit(1)
+                    if let serverName = dependencies.apiClient?.baseURL
+                        .replacingOccurrences(of: "https://", with: "")
+                        .replacingOccurrences(of: "http://", with: "")
+                        .components(separatedBy: "/").first {
+                        Text(serverName)
+                            .scaledFont(size: 10)
+                            .foregroundStyle(theme.textTertiary)
+                            .lineLimit(1)
+                    }
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { showSettings = true }
+
+                Spacer()
+
+                // New Chat button
+                Button(action: onNewChat) {
+                    Image(systemName: "square.and.pencil")
+                        .scaledFont(size: 14, weight: .semibold)
+                        .foregroundStyle(theme.brandPrimary)
+                        .frame(width: 32, height: 32)
+                        .background(theme.brandPrimary.opacity(0.1))
+                        .clipShape(Circle())
+                }
+                .accessibilityLabel("New Chat")
+
+                // More menu
+                Menu {
+                    if dependencies.authViewModel.featurePermissions.memories {
+                        Button { showMemories = true } label: {
+                            Label("Memories", systemImage: "brain.head.profile")
+                        }
+                    }
+                    if dependencies.authViewModel.hasAnyWorkspaceAccess {
+                        Button { showWorkspace = true } label: {
+                            Label("Workspace", systemImage: "square.grid.2x2")
+                        }
+                    }
+                    if dependencies.authViewModel.featurePermissions.notes
+                        && (dependencies.authViewModel.backendConfig?.features?.enableNotes ?? true) {
+                        Button { showNotes = true } label: {
+                            Label("Notes", systemImage: "note.text")
+                        }
+                    }
+                    if dependencies.authViewModel.featurePermissions.calendar {
+                        Button { showCalendar = true } label: {
+                            Label("Calendar", systemImage: "calendar")
+                        }
+                    }
+                    if dependencies.authViewModel.featurePermissions.automations
+                        && (dependencies.authViewModel.backendConfig?.features?.enableAutomations ?? true) {
+                        Button { showAutomations = true } label: {
+                            Label("Automations", systemImage: "clock.arrow.circlepath")
+                        }
+                    }
+                    Button { showUserSettings = true } label: {
+                        Label("My Defaults", systemImage: "slider.horizontal.3")
+                    }
+                    Divider()
+                    Button { showSettings = true } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                    if dependencies.authViewModel.currentUser?.role == .admin {
+                        Button { showAdminConsole = true } label: {
+                            Label("Admin Console", systemImage: "shield.lefthalf.filled")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .scaledFont(size: 12, weight: .semibold)
+                        .foregroundStyle(theme.textSecondary)
+                        .frame(width: 32, height: 32)
+                        .background(theme.surfaceContainer)
+                        .clipShape(Circle())
+                }
+            }
+            .padding(.horizontal, Spacing.md)
+            .padding(.top, Spacing.md)
+            .padding(.bottom, 10)
+
+            // Search pill
+            sidebarSearchPill
+        }
+    }
+
+    // MARK: - Sidebar Search Pill
+
+    private var sidebarSearchPill: some View {
+        HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
-                .scaledFont(size: 13, context: .list)
-                .foregroundStyle(theme.textTertiary)
+                .scaledFont(size: 12, weight: .medium, context: .list)
+                .foregroundStyle(listViewModel.searchText.isEmpty ? theme.textTertiary : theme.brandPrimary)
+                .animation(.easeInOut(duration: 0.15), value: listViewModel.searchText.isEmpty)
 
             TextField("Search conversations…", text: $listViewModel.searchText)
-                .scaledFont(size: 14, context: .list)
+                .scaledFont(size: 13, context: .list)
                 .foregroundStyle(theme.textPrimary)
+                .tint(theme.brandPrimary)
 
             if !listViewModel.searchText.isEmpty {
                 Button {
-                    listViewModel.searchText = ""
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        listViewModel.searchText = ""
+                    }
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .scaledFont(size: 13, context: .list)
                         .foregroundStyle(theme.textTertiary)
                 }
+                .transition(.scale.combined(with: .opacity))
             }
         }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .background(theme.surfaceContainer.opacity(0.7))
+        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .strokeBorder(
+                    listViewModel.searchText.isEmpty ? Color.clear : theme.brandPrimary.opacity(0.3),
+                    lineWidth: 1
+                )
+        )
+        .animation(.easeInOut(duration: 0.2), value: listViewModel.searchText.isEmpty)
         .padding(.horizontal, Spacing.md)
-        .padding(.vertical, 9)
-        .background(theme.surfaceContainer.opacity(0.6))
-        .clipShape(RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous))
-        .padding(.horizontal, Spacing.md)
-        .padding(.top, Spacing.sm)
-        .padding(.bottom, Spacing.xs)
+        .padding(.bottom, Spacing.sm)
+    }
+
+    // MARK: - Sidebar Divider
+
+    private var sidebarDivider: some View {
+        Rectangle()
+            .fill(theme.textTertiary.opacity(0.1))
+            .frame(height: 1)
+            .padding(.horizontal, Spacing.md)
+            .padding(.vertical, 6)
+    }
+
+    // MARK: - Search Bar (kept for backwards compatibility)
+
+    private var sidebarSearchBar: some View {
+        sidebarSearchPill
     }
 
     // MARK: - Selection Mode Header
@@ -1058,7 +1689,7 @@ struct iPadSidebarContent: View {
         VStack(alignment: .leading, spacing: 0) {
             // Collapsible header
             Button {
-                withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                withAnimation(MicroAnimation.snappy) {
                     foldersExpanded.toggle()
                 }
                 Haptics.play(.light)
@@ -1068,7 +1699,7 @@ struct iPadSidebarContent: View {
                         .scaledFont(size: 8, weight: .bold, context: .list)
                         .foregroundStyle(theme.textTertiary)
                         .rotationEffect(.degrees(foldersExpanded ? 0 : -90))
-                        .animation(.easeInOut(duration: AnimDuration.fast), value: foldersExpanded)
+                        .animation(MicroAnimation.snappy, value: foldersExpanded)
 
                     Image(systemName: "folder")
                         .scaledFont(size: 9, weight: .semibold, context: .list)
@@ -1140,6 +1771,44 @@ struct iPadSidebarContent: View {
                                 folderVM.folders[fIdx].chats.removeAll { $0.id == chatId }
                             }
                             if activeConversationId == chatId { onNewChat() }
+                        },
+                        onShareChat: { conversation in
+                            sharingConversation = conversation
+                        },
+                        onExportChat: { conversation, format in
+                            let ipadFormat: iPadMainChatView.ExportFormat
+                            switch format {
+                            case .json: ipadFormat = .json
+                            case .txt: ipadFormat = .txt
+                            case .pdf: ipadFormat = .pdf
+                            }
+                            onExport(conversation, ipadFormat)
+                        },
+                        onRenameChat: { conversation in
+                            renamingConversation = conversation
+                            renameText = conversation.title
+                        },
+                        onCloneChat: { conversation in
+                            Task {
+                                guard let manager = dependencies.conversationManager else { return }
+                                let cloned = try? await manager.cloneConversation(id: conversation.id)
+                                if let cloned {
+                                    await listViewModel.refreshConversations()
+                                    activeConversationId = cloned.id
+                                }
+                            }
+                        },
+                        onArchiveChat: { conversation in
+                            Task {
+                                await listViewModel.toggleArchive(conversation: conversation)
+                                if !conversation.archived && activeConversationId == conversation.id {
+                                    activeConversationId = nil
+                                    onNewChat()
+                                }
+                            }
+                        },
+                        onShareFolder: { folder in
+                            Task { await folderVM.beginEdit(folder: folder) }
                         }
                     )
                     .padding(.horizontal, Spacing.sm)
@@ -1149,13 +1818,145 @@ struct iPadSidebarContent: View {
         .animation(.easeInOut(duration: AnimDuration.medium), value: folderVM.folders.map(\.id))
     }
 
+    // MARK: - Shared Folders Section
+
+    @ViewBuilder
+    private func sharedFoldersSection(folderVM: FolderListViewModel) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(MicroAnimation.snappy) {
+                    sharedFoldersExpanded.toggle()
+                }
+                Haptics.play(.light)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.down")
+                        .scaledFont(size: 8, weight: .bold, context: .list)
+                        .foregroundStyle(theme.textTertiary)
+                        .rotationEffect(.degrees(sharedFoldersExpanded ? 0 : -90))
+                        .animation(MicroAnimation.snappy, value: sharedFoldersExpanded)
+
+                    Image(systemName: "person.2.fill")
+                        .scaledFont(size: 9, weight: .semibold, context: .list)
+                        .foregroundStyle(theme.textTertiary)
+
+                    Text("Shared with Me")
+                        .scaledFont(size: 12, weight: .medium, context: .list)
+                        .fontWeight(.bold)
+                        .foregroundStyle(theme.textTertiary)
+                        .textCase(.uppercase)
+                        .tracking(0.5)
+
+                    Spacer()
+                }
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, Spacing.sm)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if sharedFoldersExpanded {
+                ForEach(folderVM.sharedFolders) { folder in
+                    sharedFolderRow(folder: folder, folderVM: folderVM)
+                        .padding(.horizontal, Spacing.sm)
+                }
+            }
+        }
+        .animation(.easeInOut(duration: AnimDuration.medium), value: folderVM.sharedFolders.map(\.id))
+    }
+
+    @ViewBuilder
+    private func sharedFolderRow(folder: ChatFolder, folderVM: FolderListViewModel) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                Task { await folderVM.toggleSharedFolderExpanded(folder: folder) }
+                Haptics.play(.light)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .scaledFont(size: 8, weight: .bold, context: .list)
+                        .foregroundStyle(theme.textTertiary)
+                        .rotationEffect(.degrees(folder.isExpanded ? 90 : 0))
+                        .animation(MicroAnimation.snappy, value: folder.isExpanded)
+
+                    Image(systemName: "folder.fill.badge.person.crop")
+                        .scaledFont(size: 13, context: .list)
+                        .foregroundStyle(theme.brandPrimary.opacity(0.8))
+
+                    Text(folder.name)
+                        .scaledFont(size: 14, context: .list)
+                        .foregroundStyle(theme.textPrimary)
+                        .lineLimit(1)
+
+                    Spacer()
+
+                    if folder.readonly {
+                        Image(systemName: "eye")
+                            .scaledFont(size: 10, context: .list)
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                }
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, 7)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if folder.isExpanded {
+                if folder.chats.isEmpty {
+                    Text("No chats")
+                        .scaledFont(size: 13, context: .list)
+                        .foregroundStyle(theme.textTertiary)
+                        .padding(.horizontal, Spacing.md + 20)
+                        .padding(.vertical, 4)
+                } else {
+                    ForEach(folder.chats) { chat in
+                        Button {
+                            activeConversationId = chat.id
+                            activeFolderWorkspaceId = nil
+                            SharedDataService.shared.saveLastActiveConversationId(chat.id)
+                        } label: {
+                            HStack {
+                                Text(chat.title)
+                                    .scaledFont(size: 13, context: .list)
+                                    .fontWeight(activeConversationId == chat.id ? .semibold : .regular)
+                                    .foregroundStyle(
+                                        activeConversationId == chat.id ? theme.textPrimary : theme.textSecondary
+                                    )
+                                    .lineLimit(1)
+                                Spacer()
+                                if folder.readonly {
+                                    Image(systemName: "lock.fill")
+                                        .scaledFont(size: 9, context: .list)
+                                        .foregroundStyle(theme.textTertiary)
+                                }
+                            }
+                            .padding(.leading, Spacing.md + 20)
+                            .padding(.trailing, Spacing.md)
+                            .padding(.vertical, 6)
+                            .background(
+                                activeConversationId == chat.id
+                                    ? theme.brandPrimary.opacity(0.08)
+                                    : Color.clear
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .transaction { $0.animation = nil }
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Channels Section
 
     private var channelsSection: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Collapsible header
             Button {
-                withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                withAnimation(MicroAnimation.snappy) {
                     channelsExpanded.toggle()
                 }
                 Haptics.play(.light)
@@ -1165,7 +1966,7 @@ struct iPadSidebarContent: View {
                         .scaledFont(size: 8, weight: .bold, context: .list)
                         .foregroundStyle(theme.textTertiary)
                         .rotationEffect(.degrees(channelsExpanded ? 0 : -90))
-                        .animation(.easeInOut(duration: AnimDuration.fast), value: channelsExpanded)
+                        .animation(MicroAnimation.snappy, value: channelsExpanded)
 
                     Image(systemName: "bubble.left.and.bubble.right")
                         .scaledFont(size: 9, weight: .semibold, context: .list)
@@ -1248,15 +2049,23 @@ struct iPadSidebarContent: View {
         Button {
             activeChannelId = channel.id
             activeConversationId = nil
+            onCloseDrawer?()
         } label: {
             HStack(spacing: 6) {
                 if channel.type == .dm, let participant = channel.dmParticipants.first {
-                    UserAvatar(
-                        size: 22,
-                        imageURL: participant.resolveAvatarURL(serverBaseURL: dependencies.apiClient?.baseURL ?? ""),
-                        name: participant.displayName,
-                        authToken: dependencies.apiClient?.network.authToken
-                    )
+                    ZStack(alignment: .bottomTrailing) {
+                        UserAvatar(
+                            size: 22,
+                            imageURL: participant.resolveAvatarURL(serverBaseURL: dependencies.apiClient?.baseURL ?? ""),
+                            name: participant.displayName,
+                            authToken: dependencies.apiClient?.network.authToken
+                        )
+                        Circle()
+                            .fill(participant.isOnline ? Color.green : Color.gray.opacity(0.5))
+                            .frame(width: 7, height: 7)
+                            .overlay(Circle().stroke(theme.background, lineWidth: 1))
+                            .offset(x: 2, y: 2)
+                    }
                 } else {
                     Image(systemName: channel.sidebarIcon)
                         .scaledFont(size: 11, context: .list)
@@ -1320,7 +2129,7 @@ struct iPadSidebarContent: View {
         VStack(alignment: .leading, spacing: 0) {
             // Collapsible header
             Button {
-                withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                withAnimation(MicroAnimation.snappy) {
                     chatsExpanded.toggle()
                 }
                 Haptics.play(.light)
@@ -1330,7 +2139,7 @@ struct iPadSidebarContent: View {
                         .scaledFont(size: 8, weight: .bold, context: .list)
                         .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
                         .rotationEffect(.degrees(chatsExpanded ? 0 : -90))
-                        .animation(.easeInOut(duration: AnimDuration.fast), value: chatsExpanded)
+                        .animation(MicroAnimation.snappy, value: chatsExpanded)
 
                     Image(systemName: "bubble.left.and.text.bubble.right")
                         .scaledFont(size: 9, weight: .semibold, context: .list)
@@ -1467,9 +2276,9 @@ struct iPadSidebarContent: View {
 
     // MARK: - Conversation Row
 
+    @ViewBuilder
     private func conversationRow(_ conversation: Conversation) -> some View {
-        Group {
-            if listViewModel.isSelectionMode {
+        if listViewModel.isSelectionMode {
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) {
                         listViewModel.toggleSelection(for: conversation.id)
@@ -1495,12 +2304,21 @@ struct iPadSidebarContent: View {
                     .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
                 }
                 .buttonStyle(.plain)
-            } else {
+        } else {
                 Button {
-                    activeConversationId = conversation.id
+                    let targetId = conversation.id
+                    guard targetId != activeConversationId else {
+                        // Already on this chat — just close the drawer
+                        onCloseDrawer?()
+                        return
+                    }
+                    dependencies.activeChatStore.prewarm(conversationId: targetId, using: dependencies)
+                    activeConversationId = targetId
                     activeChannelId = nil
                     activeFolderWorkspaceId = nil
-                    SharedDataService.shared.saveLastActiveConversationId(conversation.id)
+                    SharedDataService.shared.saveLastActiveConversationId(targetId)
+                    onCloseDrawer?()
+                    Haptics.play(.light)
                 } label: {
                     let isActive = activeConversationId == conversation.id
                     HStack {
@@ -1556,7 +2374,6 @@ struct iPadSidebarContent: View {
                         onExport: onExport
                     )
                 }
-            }
         }
     }
 
@@ -1650,7 +2467,8 @@ struct iPadSidebarContent: View {
                                 return URL(string: "\(baseURL)/api/v1/users/\(userId)/profile/image?v=\(v)")
                             }(),
                             name: dependencies.authViewModel.currentUser?.displayName ?? "User",
-                            authToken: dependencies.apiClient?.network.authToken
+                            authToken: dependencies.apiClient?.network.authToken,
+                            dataURIString: dependencies.authViewModel.currentUser?.profileImageURL
                         )
 
                     }
@@ -1966,7 +2784,11 @@ private extension View {
                 }
             }) {
                 if let voiceCallVM = router.voiceCallViewModel {
-                    VoiceCallView(viewModel: voiceCallVM)
+                    VoiceCallView(
+                        viewModel: voiceCallVM,
+                        onMinimize: { router.minimizeVoiceCall() },
+                        onDismiss: { router.dismissVoiceCall() }
+                    )
                         .environment(dependencies)
                         .presentationDetents([.medium, .large])
                         .presentationDragIndicator(.hidden)
@@ -2235,24 +3057,22 @@ private extension View {
                 onSocketSetup()
             }
             .onChange(of: scenePhase) { oldPhase, newPhase in
-                if newPhase == .active && oldPhase != .active {
-                    let chatVM = dependencies.activeChatStore.viewModel(for: activeConversationId.wrappedValue)
-                    Task {
-                        if let socket = dependencies.socketService,
-                           !socket.isConnected, !socket.isConnecting {
-                            socket.connect()
-                        }
-                        // Refresh conversations, folders, channels, and pinned models on foreground
-                        await withTaskGroup(of: Void.self) { group in
-                            group.addTask { await listViewModel.refreshIfStale() }
-                            group.addTask { await listViewModel.folderViewModel.refreshFolders() }
-                            if let channelListVM {
-                                group.addTask { await channelListVM.refreshChannels() }
-                            }
-                            group.addTask { await chatVM.fetchPinnedModels() }
-                        }
-                        dependencies.updateWidgetData(conversations: listViewModel.conversations)
+                guard newPhase == .active && oldPhase != .active else { return }
+                let chatVM = dependencies.activeChatStore.viewModel(for: activeConversationId.wrappedValue)
+                let lvm = listViewModel
+                let deps = dependencies
+                let cvm = channelListVM
+                Task {
+                    if let socket = deps.socketService, !socket.isConnected, !socket.isConnecting {
+                        socket.connect()
                     }
+                    await withTaskGroup(of: Void.self) { group in
+                        group.addTask { await lvm.refreshIfStale() }
+                        group.addTask { await lvm.folderViewModel.refreshFolders() }
+                        if let cvm { group.addTask { await cvm.refreshChannels() } }
+                        group.addTask { await chatVM.fetchPinnedModels() }
+                    }
+                    deps.updateWidgetData(conversations: lvm.conversations)
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: .conversationTitleUpdated)) { notification in
@@ -2274,6 +3094,16 @@ private extension View {
                         group.addTask { await listViewModel.folderViewModel.refreshFolders() }
                         if let channelListVM {
                             group.addTask { await channelListVM.refreshChannels() }
+                        }
+                    }
+                    // If a folder workspace is active, reload its chats so that any new
+                    // conversation created inside the folder appears under the folder
+                    // instead of appearing stale or under normal chats.
+                    if let folderId = activeFolderWorkspaceId.wrappedValue {
+                        let folderVM = listViewModel.folderViewModel
+                        if let idx = folderVM.folders.firstIndex(where: { $0.id == folderId }) {
+                            folderVM.folders[idx].isExpanded = true
+                            await folderVM.loadChatsIfNeeded(for: folderVM.folders[idx])
                         }
                     }
                 }
@@ -2308,6 +3138,34 @@ private extension View {
             .onReceive(NotificationCenter.default.publisher(for: .openUINewChannel)) { _ in
                 // Widget "Channel" button — open the create-channel sheet
                 showCreateChannel.wrappedValue = true
+            }
+            // Folder workspace chat list row tapped — open that conversation while
+            // keeping the folder context (background image) intact.
+            .onReceive(NotificationCenter.default.publisher(for: .folderWorkspaceChatSelected)) { notification in
+                guard let chatId = notification.object as? String else { return }
+                activeConversationId.wrappedValue = chatId
+                // Keep activeFolderWorkspaceId set so the background image persists
+                SharedDataService.shared.saveLastActiveConversationId(chatId)
+            }
+            .onChange(of: listViewModel.folderViewModel.activeFolderDetail) { _, detail in
+                guard let detail,
+                      detail.id == activeFolderWorkspaceId.wrappedValue else { return }
+                // Merge: use the full detail's meta/data (backgroundImageUrl, icon, systemPrompt,
+                // modelIds) but preserve the chats from the flat list folder so both the
+                // background image AND the recent-chats list are always visible together.
+                var merged = detail
+                if merged.chats.isEmpty,
+                   let flatFolder = listViewModel.folderViewModel.folders.first(where: { $0.id == detail.id }),
+                   !flatFolder.chats.isEmpty {
+                    merged.chats = flatFolder.chats
+                }
+                // Note: iPadMainChatView uses activeFolderWorkspaceId binding from parent;
+                // the activeFolderForWorkspace @State is in iPadMainChatView itself — post
+                // a notification so iPadMainChatView can update it.
+                // Actually we update it directly via the drawerPanel's onSelectFolder callback
+                // which is already wired. Here we just need to trigger the folder workspace
+                // to rebuild by refreshing the folderVM. The actual activeFolderForWorkspace
+                // update happens in iPadMainChatView.drawerPanel.onSelectFolder reactive path.
             }
             .onChange(of: dependencies.authViewModel.accountSwitchCount) {
                 // Account was switched — perform a full reset so the new account's

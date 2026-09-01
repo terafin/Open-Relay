@@ -19,15 +19,17 @@ enum UsersSubTab: String, CaseIterable {
 enum AdminConsoleTab: String, CaseIterable {
     case users       = "Users"
     case analytics   = "Analytics"
+    case evaluations = "Evaluations"
     case functions   = "Functions"
     case settings    = "Settings"
 
     var icon: String {
         switch self {
-        case .users:     return "person.2"
-        case .analytics: return "chart.bar.xaxis"
-        case .functions: return "function"
-        case .settings:  return "gear"
+        case .users:       return "person.2"
+        case .analytics:   return "chart.bar.xaxis"
+        case .evaluations: return "hand.thumbsup"
+        case .functions:   return "function"
+        case .settings:    return "gear"
         }
     }
 }
@@ -35,37 +37,47 @@ enum AdminConsoleTab: String, CaseIterable {
 // MARK: - Settings Sub-Section
 
 enum SettingsSubSection: String, CaseIterable {
-    case general      = "General"
-    case connections  = "Connections"
-    case models       = "Models"
-    case integrations = "Integrations"
-    case documents    = "Documents"
-    case webSearch    = "Web Search"
-    case codeExecution = "Code Execution"
-    case interface_   = "Interface"
-    case audio        = "Audio"
-    case images       = "Images"
+    case general           = "General"
+    case authentication    = "Authentication"
+    case connections       = "Connections"
+    case models            = "Models"
+    case integrations      = "Integrations"
+    case documents         = "Documents"
+    case webSearch         = "Web Search"
+    case codeExecution     = "Code Execution"
+    case interface_        = "Interface"
+    case audio             = "Audio"
+    case images            = "Images"
+    case subagents         = "Sub-agents"
+    case pipelines         = "Pipelines"
+    case database          = "Database"
 
     var icon: String {
         switch self {
-        case .general:       return "gear"
-        case .connections:   return "link"
-        case .models:        return "cpu"
-        case .integrations:  return "wrench.and.screwdriver"
-        case .documents:     return "doc.text"
-        case .webSearch:     return "globe"
-        case .codeExecution: return "terminal"
-        case .interface_:    return "slider.horizontal.3"
-        case .audio:         return "waveform"
-        case .images:        return "photo"
+        case .general:        return "gear"
+        case .authentication: return "lock.shield"
+        case .connections:    return "link"
+        case .models:         return "cpu"
+        case .integrations:   return "wrench.and.screwdriver"
+        case .documents:      return "doc.text"
+        case .webSearch:      return "globe"
+        case .codeExecution:  return "terminal"
+        case .interface_:     return "slider.horizontal.3"
+        case .audio:          return "waveform"
+        case .images:         return "photo"
+        case .subagents:      return "person.2.circle"
+        case .pipelines:      return "puzzlepiece.extension"
+        case .database:       return "doc.badge.gearshape"
         }
     }
 
     var displayName: String {
         switch self {
-        case .interface_: return "Interface"
-        case .codeExecution: return "Code Execution"
-        case .webSearch: return "Web Search"
+        case .authentication: return "Authentication"
+        case .interface_:     return "Interface"
+        case .codeExecution:  return "Code Execution"
+        case .webSearch:      return "Web Search"
+        case .subagents:      return "Sub-agents"
         default: return rawValue
         }
     }
@@ -101,6 +113,8 @@ struct AdminConsoleView: View {
                     AdminUsersTab()
                 case .analytics:
                     AdminAnalyticsView()
+                case .evaluations:
+                    AdminFeedbackView()
                 case .functions:
                     AdminFunctionsView()
                 case .settings:
@@ -304,6 +318,7 @@ struct AdminUsersListView: View {
             UserChatsSheet(
                 viewModel: viewModel,
                 serverBaseURL: dependencies.apiClient?.baseURL ?? "",
+                apiClient: dependencies.apiClient,
                 onClone: { clonedConversation in
                     showChatsSheet = false
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {

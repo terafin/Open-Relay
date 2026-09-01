@@ -75,7 +75,7 @@ final class ServerConnectionMonitor: @unchecked Sendable {
     @ObservationIgnored private var pathMonitor: NWPathMonitor?
     @ObservationIgnored private let monitorQueue = DispatchQueue(label: "com.openui.connection.monitor")
 
-    /// Whether the device network path is satisfied (has internet).
+    /// Whether the device network path is satisfied (has internet or a local interface).
     @ObservationIgnored private var isNetworkAvailable: Bool = true
 
     /// Whether the app is currently in the background.
@@ -278,19 +278,28 @@ final class ServerConnectionMonitor: @unchecked Sendable {
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self else { return }
             let wasAvailable = self.isNetworkAvailable
-            let nowAvailable = path.status == .satisfied
+
+            // Whether any relevant interface (WiFi, Ethernet, cellular) is present.
+            // We treat "has an interface" as sufficient rather than relying solely on
+            // path.status == .satisfied — the actual server reachability is verified
+            // by the /health poll, not by NWPathMonitor's notion of "internet access".
+            // This keeps behaviour identical for LAN-only and internet-routable servers.
+            let hasInterface = path.availableInterfaces.contains(where: {
+                $0.type == .wifi || $0.type == .wiredEthernet || $0.type == .cellular
+            })
+            let nowAvailable = (path.status == .satisfied) || hasInterface
 
             self.isNetworkAvailable = nowAvailable
 
             if !nowAvailable {
-                // Device lost internet — transition immediately even in background
-                // (NWPathMonitor is reliable; this is a real loss)
+                // Device truly lost all network interfaces — transition immediately
+                // even in background (NWPathMonitor is reliable; this is a real loss).
                 Task { @MainActor [weak self] in
                     self?.consecutiveFailures = self?.failureThreshold ?? 2 // mark as failed
                     self?.transitionTo(.internetDown)
                 }
             } else if !wasAvailable && nowAvailable {
-                // Internet just came back
+                // Network just came back
                 self.logger.info("NWPathMonitor: network restored")
                 // Only run an immediate check if we're in the foreground
                 if !self.isAppInBackground {
@@ -298,6 +307,7 @@ final class ServerConnectionMonitor: @unchecked Sendable {
                 }
             }
         }
+
 
         monitor.start(queue: monitorQueue)
     }
@@ -363,9 +373,14 @@ final class ServerConnectionMonitor: @unchecked Sendable {
                 }
 
                 if !self.isNetworkAvailable {
+                    // Device-level network is gone — this is an internet-down state.
                     self.transitionTo(.internetDown)
                 } else {
-                    // NWPath says we're online — check if internet actually works
+                    // NWPath says a network interface is available — check whether
+                    // internet actually works (distinguishes captive portals / DNS-only
+                    // environments from a genuinely unreachable server). Behaviour is
+                    // identical regardless of whether the server is on a LAN or the
+                    // public internet — only the /health poll result matters.
                     Task { [weak self] in
                         guard let self else { return }
                         let externalReachable = await self.pingExternalEndpoint()
@@ -377,6 +392,7 @@ final class ServerConnectionMonitor: @unchecked Sendable {
             }
         }
     }
+
 
     /// Pings Apple's captive portal URL to determine if the device actually
     /// has working internet (as opposed to a captive portal or blocked network).

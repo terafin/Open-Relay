@@ -47,6 +47,31 @@ struct SharedChatsView: View {
                             .clipShape(Circle())
                     }
                 }
+                if case .content = viewModel.viewState, !viewModel.conversations.isEmpty {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button {
+                            viewModel.confirmUnshareAll = true
+                        } label: {
+                            Text("Revoke All")
+                                .scaledFont(size: 14, weight: .medium)
+                                .foregroundStyle(theme.error)
+                        }
+                        .disabled(viewModel.isUnshareAllInProgress)
+                    }
+                }
+            }
+            // Revoke All confirmation dialog
+            .confirmationDialog(
+                "Revoke All Share Links",
+                isPresented: $viewModel.confirmUnshareAll,
+                titleVisibility: .visible
+            ) {
+                Button("Revoke All", role: .destructive) {
+                    viewModel.unshareAll()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("All share links will be revoked. Anyone with a link will no longer be able to view those chats.")
             }
             // Revoke confirmation dialog
             .confirmationDialog(

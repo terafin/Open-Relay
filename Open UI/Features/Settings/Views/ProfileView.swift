@@ -15,6 +15,14 @@ struct ProfileView: View {
     @State private var showBirthDatePicker = false
     @State private var editWebhookURL = ""
 
+    // MARK: - Chat Variables (v0.11.0)
+    @State private var chatVariables: [String: String] = [:]
+    @State private var showAddVariableSheet = false
+    @State private var editingVariableKey: String? = nil
+    @State private var newVarKey = ""
+    @State private var newVarValue = ""
+    @State private var variableKeyError: String? = nil
+
     // MARK: - Profile Image
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var profileImageData: Data?
@@ -54,6 +62,40 @@ struct ProfileView: View {
 
     private let genderOptions = ["Prefer not to say", "Male", "Female", "Custom"]
 
+    // MARK: - Cached Formatters
+
+    /// ISO 8601 date formatter used to parse and serialise the birth date (YYYY-MM-DD).
+    /// Locale is fixed to en_US_POSIX so the format is never locale-sensitive.
+    /// No explicit timezone — uses the device's local timezone so that "1999-12-29"
+    /// parses as midnight local time and displays correctly in the UI.
+    private static let dobAPIFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
+    /// Parse a date string returned by the server.
+    /// Handles multiple formats the server may return:
+    ///   "1999-12-28"               (pure date)
+    ///   "1999-12-28T00:00:00"      (datetime, no timezone)
+    ///   "1999-12-28T00:00:00Z"     (datetime UTC)
+    private static func parseDOB(_ string: String) -> Date? {
+        // Fast path: plain date string
+        if let d = dobAPIFormatter.date(from: string) {
+            print("[DOB] parseDOB('\(string)') → plain parse succeeded → \(d)")
+            return d
+        }
+        // Fallback: datetime string — strip time component and parse date part
+        let datePart = String(string.prefix(10))
+        if let d = dobAPIFormatter.date(from: datePart) {
+            print("[DOB] parseDOB('\(string)') → fallback datePart '\(datePart)' → \(d)")
+            return d
+        }
+        print("[DOB] parseDOB('\(string)') → ALL formats FAILED, returning nil")
+        return nil
+    }
+
     enum ProfileImageAction {
         case keep, remove, initials, newImage(Data)
     }
@@ -70,6 +112,9 @@ struct ProfileView: View {
 
                 // Notifications
                 notificationsSection
+
+                // Chat Variables (v0.11.0)
+                chatVariablesSection
 
                 // Security
                 securitySection
@@ -264,6 +309,181 @@ struct ProfileView: View {
             .background(theme.surfaceContainer)
             .clipShape(RoundedRectangle(cornerRadius: CornerRadius.lg, style: .continuous))
         }
+    }
+
+    // MARK: - Chat Variables Section (v0.11.0)
+
+    private var chatVariablesSection: some View {
+        VStack(alignment: .leading, spacing: Spacing.xs) {
+            HStack {
+                sectionHeader("CHAT VARIABLES")
+                Spacer()
+                Button {
+                    newVarKey = ""
+                    newVarValue = ""
+                    editingVariableKey = nil
+                    variableKeyError = nil
+                    showAddVariableSheet = true
+                } label: {
+                    Image(systemName: "plus.circle.fill")
+                        .scaledFont(size: 20)
+                        .foregroundStyle(theme.brandPrimary)
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, Spacing.md)
+            }
+
+            if chatVariables.isEmpty {
+                VStack(spacing: Spacing.sm) {
+                    Image(systemName: "curlybraces")
+                        .scaledFont(size: 28)
+                        .foregroundStyle(theme.textTertiary)
+                    Text("No variables yet")
+                        .scaledFont(size: 14)
+                        .foregroundStyle(theme.textTertiary)
+                    Text("Use {{VAR_NAME}} in any chat message to insert the variable's value.")
+                        .scaledFont(size: 12)
+                        .foregroundStyle(theme.textTertiary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, Spacing.lg)
+                .background(theme.surfaceContainer)
+                .clipShape(RoundedRectangle(cornerRadius: CornerRadius.lg, style: .continuous))
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(chatVariables.keys.sorted().enumerated()), id: \.element) { index, key in
+                        let value = chatVariables[key] ?? ""
+                        let isLast = index == chatVariables.count - 1
+
+                        VStack(spacing: 0) {
+                            HStack(spacing: Spacing.sm) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("{{\(key)}}")
+                                        .scaledFont(size: 13, weight: .semibold)
+                                        .foregroundStyle(theme.brandPrimary)
+                                        .fontDesign(.monospaced)
+                                    Text(value.isEmpty ? "(empty)" : value)
+                                        .scaledFont(size: 14)
+                                        .foregroundStyle(value.isEmpty ? theme.textTertiary : theme.textPrimary)
+                                        .lineLimit(2)
+                                }
+                                Spacer()
+                                Button {
+                                    newVarKey = key
+                                    newVarValue = value
+                                    editingVariableKey = key
+                                    variableKeyError = nil
+                                    showAddVariableSheet = true
+                                } label: {
+                                    Image(systemName: "pencil")
+                                        .scaledFont(size: 13)
+                                        .foregroundStyle(theme.textTertiary)
+                                        .frame(width: 28, height: 28)
+                                }
+                                .buttonStyle(.plain)
+
+                                Button {
+                                    _ = withAnimation { chatVariables.removeValue(forKey: key) }
+                                    Task { await saveVariables() }
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .scaledFont(size: 13)
+                                        .foregroundStyle(theme.error)
+                                        .frame(width: 28, height: 28)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.horizontal, Spacing.md)
+                            .padding(.vertical, 12)
+
+                            if !isLast {
+                                Divider().padding(.leading, Spacing.md)
+                            }
+                        }
+                    }
+                }
+                .background(theme.surfaceContainer)
+                .clipShape(RoundedRectangle(cornerRadius: CornerRadius.lg, style: .continuous))
+            }
+        }
+        .sheet(isPresented: $showAddVariableSheet) {
+            chatVariableSheet
+        }
+    }
+
+    private var chatVariableSheet: some View {
+        NavigationStack {
+            Form {
+                Section(footer: Text("Variable names must be letters, numbers, and underscores only. Use {{VARIABLE_NAME}} in chat messages.")) {
+                    HStack {
+                        Text("{{")
+                            .scaledFont(size: 15, weight: .semibold)
+                            .foregroundStyle(theme.brandPrimary)
+                            .fontDesign(.monospaced)
+                        TextField("VARIABLE_NAME", text: $newVarKey)
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled()
+                            .onChange(of: newVarKey) { _, v in
+                                // Only allow valid identifier chars
+                                let filtered = v.filter { $0.isLetter || $0.isNumber || $0 == "_" }
+                                if filtered != v { newVarKey = filtered }
+                                variableKeyError = nil
+                            }
+                            .disabled(editingVariableKey != nil)
+                        Text("}}")
+                            .scaledFont(size: 15, weight: .semibold)
+                            .foregroundStyle(theme.brandPrimary)
+                            .fontDesign(.monospaced)
+                    }
+
+                    TextField("Value", text: $newVarValue, axis: .vertical)
+                        .lineLimit(1...4)
+                        .autocorrectionDisabled()
+                }
+
+                if let error = variableKeyError {
+                    Section {
+                        Text(error)
+                            .foregroundStyle(theme.error)
+                            .scaledFont(size: 13)
+                    }
+                }
+            }
+            .navigationTitle(editingVariableKey == nil ? "New Variable" : "Edit Variable")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showAddVariableSheet = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        let trimmedKey = newVarKey.trimmingCharacters(in: .whitespaces).uppercased()
+                        guard !trimmedKey.isEmpty else {
+                            variableKeyError = "Variable name cannot be empty."
+                            return
+                        }
+                        // If adding new, check for duplicate
+                        if editingVariableKey == nil && chatVariables[trimmedKey] != nil {
+                            variableKeyError = "A variable with this name already exists."
+                            return
+                        }
+                        if let old = editingVariableKey, old != trimmedKey {
+                            chatVariables.removeValue(forKey: old)
+                        }
+                        chatVariables[trimmedKey] = newVarValue
+                        showAddVariableSheet = false
+                        editingVariableKey = nil
+                        Task { await saveVariables() }
+                    }
+                    .fontWeight(.semibold)
+                    .disabled(newVarKey.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+        }
+        .presentationDetents([.medium])
+        .presentationDragIndicator(.visible)
+        .presentationCornerRadius(24)
     }
 
     // MARK: - Security Section
@@ -511,15 +731,21 @@ struct ProfileView: View {
             defer { isLoadingSettings = false }
 
             // 1. Fetch fresh user data from server
+            // IMPORTANT: capture freshUser locally so we populate the form from the
+            // live network response — not from viewModel.currentUser which may still
+            // hold the old cached value at the point the guard runs.
+            var userToLoad: User?
             do {
                 let freshUser = try await api.getCurrentUser()
                 await MainActor.run { viewModel.currentUser = freshUser }
                 viewModel.cacheCurrentUser()
+                userToLoad = freshUser
             } catch {
                 // Fall back to cached user if server fetch fails
+                userToLoad = viewModel.currentUser
             }
 
-            guard let user = viewModel.currentUser else { return }
+            guard let user = userToLoad else { return }
 
             await MainActor.run {
                 // 2. Populate form fields from (fresh) user
@@ -532,11 +758,13 @@ struct ProfileView: View {
                     editGender = "Prefer not to say"
                 }
 
+                print("[DOB] user.dateOfBirth from server = '\(user.dateOfBirth ?? "nil")'")
                 if let dob = user.dateOfBirth, !dob.isEmpty {
-                    let formatter = DateFormatter()
-                    formatter.dateFormat = "MM/dd/yyyy"
-                    editBirthDate = formatter.date(from: dob)
+                    let parsed = ProfileView.parseDOB(dob)
+                    print("[DOB] editBirthDate set to: \(parsed?.description ?? "nil")")
+                    editBirthDate = parsed
                 } else {
+                    print("[DOB] dateOfBirth is nil or empty — setting editBirthDate = nil")
                     editBirthDate = nil
                 }
 
@@ -576,6 +804,16 @@ struct ProfileView: View {
                 }
             } catch {
                 // Silently fail — webhook is optional
+            }
+
+            // 6. Load chat variables
+            do {
+                let vars = try await api.getUserVariables()
+                await MainActor.run {
+                    chatVariables = vars.variables
+                }
+            } catch {
+                // Silently fail — variables are optional
             }
         }
     }
@@ -651,13 +889,7 @@ struct ProfileView: View {
 
             let dobValue: String?
             if editBirthDate != originalBirthDate {
-                if let date = editBirthDate {
-                    let formatter = DateFormatter()
-                    formatter.dateFormat = "MM/dd/yyyy"
-                    dobValue = formatter.string(from: date)
-                } else {
-                    dobValue = nil
-                }
+                dobValue = editBirthDate.map { ProfileView.dobAPIFormatter.string(from: $0) }
             } else {
                 dobValue = viewModel.currentUser?.dateOfBirth
             }
@@ -725,6 +957,17 @@ struct ProfileView: View {
         } catch {
             saveError = APIError.from(error).errorDescription ?? "Failed to update profile."
             isSaving = false
+        }
+    }
+
+    // MARK: - Save Variables
+
+    private func saveVariables() async {
+        guard let api = dependencies.apiClient else { return }
+        do {
+            _ = try await api.updateUserVariables(chatVariables)
+        } catch {
+            // Silently fail — variables save is non-critical
         }
     }
 

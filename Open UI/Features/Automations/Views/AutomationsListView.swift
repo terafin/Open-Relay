@@ -126,8 +126,8 @@ private struct AutomationsContentView: View {
                     }
                 }
             }
-            .sheet(isPresented: $vm.showCreateSheet) {
-                CreateAutomationSheet(vm: vm)
+            .sheet(isPresented: $vm.showCreateSheet, onDismiss: { vm.cloneSource = nil }) {
+                CreateAutomationSheet(vm: vm, prefill: vm.cloneSource)
             }
             .sheet(item: $selectedForDetail) { automation in
                 NavigationStack {
@@ -163,6 +163,7 @@ private struct AutomationsContentView: View {
                     onToggle: { Task { await vm.toggle(automation) } },
                     onEdit: { selectedForDetail = automation },
                     onRunNow: { Task { await vm.runNow(automation) } },
+                    onClone: { vm.cloneAutomation(automation) },
                     onDelete: {
                         vm.deletingAutomation = automation
                         vm.showDeleteConfirmation = true
@@ -224,6 +225,7 @@ private struct AutomationRow: View {
     let onToggle: () -> Void
     let onEdit: () -> Void
     let onRunNow: () -> Void
+    let onClone: () -> Void
     let onDelete: () -> Void
 
     @Environment(\.theme) private var theme
@@ -249,6 +251,9 @@ private struct AutomationRow: View {
                 }
                 Button { onRunNow() } label: {
                     Label("Run Now", systemImage: "play")
+                }
+                Button { onClone() } label: {
+                    Label("Clone", systemImage: "doc.on.doc")
                 }
                 Divider()
                 Button(role: .destructive) { onDelete() } label: {

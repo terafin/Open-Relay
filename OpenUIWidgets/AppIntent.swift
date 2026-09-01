@@ -33,7 +33,7 @@ struct NewChatWidgetIntent: AppIntent {
     static var title: LocalizedStringResource = "New Chat"
     static var description = IntentDescription("Start a new AI chat in Open Relay.")
     static var openAppWhenRun: Bool = true
-    static var isDiscoverable: Bool = true
+    static var isDiscoverable: Bool = false
 
     func perform() async throws -> some IntentResult & OpensIntent {
         .result(opensIntent: OpenURLIntent(OpenUIURL.newChat))
@@ -47,7 +47,7 @@ struct VoiceCallWidgetIntent: AppIntent {
     static var title: LocalizedStringResource = "Voice Call"
     static var description = IntentDescription("Start a voice call in Open Relay.")
     static var openAppWhenRun: Bool = true
-    static var isDiscoverable: Bool = true
+    static var isDiscoverable: Bool = false
 
     func perform() async throws -> some IntentResult & OpensIntent {
         .result(opensIntent: OpenURLIntent(OpenUIURL.voiceCall))
@@ -61,7 +61,7 @@ struct CameraChatWidgetIntent: AppIntent {
     static var title: LocalizedStringResource = "Camera Chat"
     static var description = IntentDescription("Open a new chat with camera in Open Relay.")
     static var openAppWhenRun: Bool = true
-    static var isDiscoverable: Bool = true
+    static var isDiscoverable: Bool = false
 
     func perform() async throws -> some IntentResult & OpensIntent {
         .result(opensIntent: OpenURLIntent(OpenUIURL.cameraChat))
@@ -75,7 +75,7 @@ struct PhotosChatWidgetIntent: AppIntent {
     static var title: LocalizedStringResource = "Photos Chat"
     static var description = IntentDescription("Open a new chat with photo picker in Open Relay.")
     static var openAppWhenRun: Bool = true
-    static var isDiscoverable: Bool = true
+    static var isDiscoverable: Bool = false
 
     func perform() async throws -> some IntentResult & OpensIntent {
         .result(opensIntent: OpenURLIntent(OpenUIURL.photosChat))
@@ -89,7 +89,7 @@ struct FileChatWidgetIntent: AppIntent {
     static var title: LocalizedStringResource = "File Chat"
     static var description = IntentDescription("Open a new chat with file picker in Open Relay.")
     static var openAppWhenRun: Bool = true
-    static var isDiscoverable: Bool = true
+    static var isDiscoverable: Bool = false
 
     func perform() async throws -> some IntentResult & OpensIntent {
         .result(opensIntent: OpenURLIntent(OpenUIURL.fileChat))
@@ -103,7 +103,7 @@ struct NewChannelWidgetIntent: AppIntent {
     static var title: LocalizedStringResource = "New Channel"
     static var description = IntentDescription("Create a new channel in Open Relay.")
     static var openAppWhenRun: Bool = true
-    static var isDiscoverable: Bool = true
+    static var isDiscoverable: Bool = false
 
     func perform() async throws -> some IntentResult & OpensIntent {
         .result(opensIntent: OpenURLIntent(OpenUIURL.newChannel))

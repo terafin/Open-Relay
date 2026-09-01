@@ -48,6 +48,7 @@ struct ModelListView: View {
     @State private var searchText = ""
     @State private var showCreateSheet = false
     @State private var editingModel: ModelDetail? = nil
+    @State private var cloningFromModel: ModelDetail? = nil
     @State private var deletingModel: ModelItem? = nil
     @State private var errorMessage: String? = nil
 
@@ -120,6 +121,14 @@ struct ModelListView: View {
         .sheet(item: $editingModel) { detail in
             ModelEditorView(
                 existingModel: detail,
+                onSave: { _ in Task { await manager.fetchAll() } }
+            )
+        }
+        // Clone sheet — opens a pre-filled "New Model" editor matching web UI behaviour
+        .sheet(item: $cloningFromModel) { source in
+            ModelEditorView(
+                existingModel: nil,
+                cloneSource: source,
                 onSave: { _ in Task { await manager.fetchAll() } }
             )
         }
@@ -301,16 +310,18 @@ struct ModelListView: View {
 
             Spacer()
 
-            // Active toggle
-            Button {
-                Haptics.play(.light)
-                Task { await toggleActive(id: model.id, manager: manager) }
-            } label: {
-                Image(systemName: model.isActive ? "checkmark.circle.fill" : "circle")
-                    .scaledFont(size: 20)
-                    .foregroundStyle(model.isActive ? theme.brandPrimary : theme.textTertiary)
+            // Active toggle — only for models the user owns/can write
+            if model.writeAccess {
+                Button {
+                    Haptics.play(.light)
+                    Task { await toggleActive(id: model.id, manager: manager) }
+                } label: {
+                    Image(systemName: model.isActive ? "checkmark.circle.fill" : "circle")
+                        .scaledFont(size: 20)
+                        .foregroundStyle(model.isActive ? theme.brandPrimary : theme.textTertiary)
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
         .padding(.vertical, Spacing.sm)
         .contentShape(Rectangle())
@@ -318,23 +329,27 @@ struct ModelListView: View {
             Task { await openEditor(for: model, manager: manager) }
         }
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-            Button(role: .destructive) {
-                deletingModel = model
-            } label: {
-                Label("Delete", systemImage: "trash")
+            if model.writeAccess {
+                Button(role: .destructive) {
+                    deletingModel = model
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
             }
         }
         .swipeActions(edge: .leading, allowsFullSwipe: true) {
-            Button {
-                Haptics.play(.light)
-                Task { await toggleActive(id: model.id, manager: manager) }
-            } label: {
-                Label(
-                    model.isActive ? "Deactivate" : "Activate",
-                    systemImage: model.isActive ? "pause.circle" : "play.circle"
-                )
+            if model.writeAccess {
+                Button {
+                    Haptics.play(.light)
+                    Task { await toggleActive(id: model.id, manager: manager) }
+                } label: {
+                    Label(
+                        model.isActive ? "Deactivate" : "Activate",
+                        systemImage: model.isActive ? "pause.circle" : "play.circle"
+                    )
+                }
+                .tint(model.isActive ? .orange : theme.brandPrimary)
             }
-            .tint(model.isActive ? .orange : theme.brandPrimary)
         }
         .contextMenu {
             Button {
@@ -342,21 +357,25 @@ struct ModelListView: View {
             } label: {
                 Label("Edit", systemImage: "pencil")
             }
-            Button {
-                Haptics.play(.light)
-                Task { await toggleActive(id: model.id, manager: manager) }
-            } label: {
-                Label(
-                    model.isActive ? "Deactivate" : "Activate",
-                    systemImage: model.isActive ? "pause.circle" : "play.circle"
-                )
+            if model.writeAccess {
+                Button {
+                    Haptics.play(.light)
+                    Task { await toggleActive(id: model.id, manager: manager) }
+                } label: {
+                    Label(
+                        model.isActive ? "Deactivate" : "Activate",
+                        systemImage: model.isActive ? "pause.circle" : "play.circle"
+                    )
+                }
             }
             Divider()
-            Button {
-                Haptics.play(.light)
-                Task { await cloneModel(model, manager: manager) }
-            } label: {
-                Label("Clone", systemImage: "plus.square.on.square")
+            if model.writeAccess {
+                Button {
+                    Haptics.play(.light)
+                    Task { await cloneModel(model, manager: manager) }
+                } label: {
+                    Label("Clone", systemImage: "plus.square.on.square")
+                }
             }
             if dependencies.authViewModel.workspacePermissions.modelsExport {
                 Button {
@@ -366,11 +385,13 @@ struct ModelListView: View {
                     Label("Export", systemImage: "square.and.arrow.up")
                 }
             }
-            Divider()
-            Button(role: .destructive) {
-                deletingModel = model
-            } label: {
-                Label("Delete", systemImage: "trash")
+            if model.writeAccess {
+                Divider()
+                Button(role: .destructive) {
+                    deletingModel = model
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
             }
         }
     }
@@ -400,24 +421,19 @@ struct ModelListView: View {
                 modelAvatarFallback
             }
         } else {
-            let resolvedURL: URL? = {
-                guard !urlString.isEmpty else { return nil }
-                if urlString.hasPrefix("http") { return URL(string: urlString) }
-                // Server-relative paths (including /static/favicon.png) — prepend base URL
-                return URL(string: serverBaseURL + urlString)
-            }()
-
-            if let resolvedURL {
-                AsyncImage(url: resolvedURL) { phase in
-                    switch phase {
-                    case .success(let img):
-                        img.resizable()
-                            .scaledToFill()
-                            .frame(width: 40, height: 40)
-                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    default:
-                        modelAvatarFallback
-                    }
+            // Use the authenticated per-model avatar endpoint so the Bearer token is sent.
+            // ModelItem.resolveAvatarURL always returns the /api/v1/models/model/profile/image
+            // endpoint for non-HTTP URLs, falling back to the raw URL for external HTTP(S) ones.
+            let avatarURL = model.resolveAvatarURL(baseURL: serverBaseURL)
+            if let avatarURL {
+                CachedAsyncImage(url: avatarURL, authToken: authToken) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 40, height: 40)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                } placeholder: {
+                    modelAvatarFallback
                 }
             } else {
                 modelAvatarFallback
@@ -536,10 +552,13 @@ struct ModelListView: View {
         }
     }
 
+    /// Clone: fetch the full model detail, then open a pre-filled "New Model" editor.
+    /// This matches the web UI behaviour — the user reviews/edits the clone name/ID before saving.
     private func cloneModel(_ model: ModelItem, manager: ModelManager) async {
         do {
-            try await manager.clone(id: model.id)
-            Haptics.notify(.success)
+            let detail = try await manager.getDetail(id: model.id)
+            cloningFromModel = detail
+            Haptics.play(.light)
         } catch {
             errorMessage = error.localizedDescription
         }

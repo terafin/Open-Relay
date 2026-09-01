@@ -51,6 +51,12 @@ final class ActiveChatStore {
     /// Updated by AppDependencyContainer.fetchTaskConfig().
     var serverTaskConfig: TaskConfig = .default
 
+    /// Session-level cache for the server's user-facing feature flags (from BackendConfig.features).
+    /// Set once by ChatDetailView after `backendConfig` is available.
+    /// Used by `isMemoryAvailable` to show the memory toggle for all models when memories
+    /// are enabled server-side — not just models with `builtinTools.memory`.
+    var serverFeatures: GroupFeaturePermissions? = nil
+
     /// Session-level cache for the user's memory setting (`ui.memory`).
     /// Populated by the first ChatViewModel that fetches it, then reused by
     /// all subsequent VMs so `GET /api/v1/users/user/settings` is called at
@@ -63,6 +69,16 @@ final class ActiveChatStore {
     /// Populated by the first ChatViewModel that fetches user settings.
     /// Cleared on logout/server switch.
     var cachedMessageQueueSetting: Bool? = nil
+
+    /// Session-level cache for the server's message rating feature flag.
+    /// Populated after the first ChatViewModel fetches backend config.
+    /// Cleared on logout/server switch.
+    var cachedMessageRatingEnabled: Bool? = nil
+
+    /// Whether the server admin has enabled tool-approval (human-in-the-loop) permissions.
+    /// Populated from `BackendConfig.features.enableToolPermissions` after the first config fetch.
+    /// Cleared on logout/server switch.
+    var enableToolPermissions: Bool = false
 
     /// Session-level cache for the user's default params (`ui.system` + `ui.params`).
     /// Populated by the first ChatViewModel that fetches user settings.
@@ -202,6 +218,8 @@ final class ActiveChatStore {
         cachedMessageQueueSetting = nil
         cachedUserDefaultParams = nil
         cachedPinnedModelIds = nil
+        cachedMessageRatingEnabled = nil
+        enableToolPermissions = false
         cachedUserName = nil
         cachedUserEmail = nil
     }
@@ -340,6 +358,25 @@ final class AppDependencyContainer: ServiceContainer {
     /// Incremented each time new URLs are queued in `pendingIncomingWebURLs`.
     var pendingIncomingWebURLsVersion: Int = 0
 
+    // MARK: - Deep-link / URL-scheme pending actions
+
+    /// A model ID passed via the `openui://new-chat?model=` URL query parameter.
+    /// Consumed once by `ChatDetailView` to override the selected model on new chats.
+    var pendingIncomingModelId: String?
+
+    /// Incremented each time a new model override arrives from the URL scheme.
+    /// `ChatDetailView` observes this via `onChange` to apply the override.
+    var pendingIncomingModelVersion: Int = 0
+
+    /// When `true`, `ChatDetailView` should automatically send the pre-filled
+    /// input text immediately after the chat opens (i.e. `send=true` was in the URL).
+    /// Consumed once and reset to `false` after the send fires.
+    var pendingAutoSend: Bool = false
+
+    /// Incremented alongside `pendingAutoSend` so the `onChange` fires even when
+    /// the flag is toggled back to `false` between two rapid deep-link invocations.
+    var pendingAutoSendVersion: Int = 0
+
     init() {
         self.serverConfigStore = ServerConfigStore()
         self.appearanceManager = AppearanceManager()
@@ -440,12 +477,27 @@ final class AppDependencyContainer: ServiceContainer {
             fileAttachmentService.configure(with: manager)
         }
 
-        // Set up 401 callback for automatic re-auth
+        // Set up 401 callback for mid-session token expiry.
+        // IMPORTANT: Only fire when the user is already authenticated — NOT during
+        // session restore on launch. restoreSession() already handles launch-time 401s
+        // via its own requiresReauth check (clears token + routes to login correctly).
+        // Firing this callback during .restoringSession would flash the login screen
+        // spuriously on slow networks before restoreSession() has finished its work.
+        //
+        // BACKGROUND-RESUME FIX: Instead of immediately kicking the user to the login
+        // screen, first attempt background re-validation via the REST API. This handles
+        // the common case where a 401 fires from the socket reconnect on foreground
+        // return (the socket uses an expired token from before the long background)
+        // but the server will actually issue a fresh token when the REST endpoint is hit.
+        // validateSessionInBackground() has the correct retry logic:
+        //   - Genuine 401 from REST → clears token, shows login (correct sign-out)
+        //   - Transient network error → keeps user in app silently
+        //   - Success → refreshes currentUser and stays authenticated
         apiClient?.onAuthTokenInvalid = { [weak self] in
             Task { @MainActor in
-                self?.authViewModel.currentUser = nil
-                self?.authViewModel.phase = .authMethodSelection
-                self?.authViewModel.errorMessage = "Your session has expired. Please sign in again."
+                guard let self else { return }
+                guard self.authViewModel.phase == .authenticated else { return }
+                await self.authViewModel.validateSessionInBackground()
             }
         }
 
@@ -628,6 +680,8 @@ final class AppDependencyContainer: ServiceContainer {
     /// follow-ups, tags, autocomplete) the admin has enabled globally.
     func fetchTaskConfig() async {
         guard let client = apiClient else { return }
+        // Sync the current user's role into APIClient so parseModelArray can
+        // filter hidden models correctly (admins see hidden models; users don't).
         do {
             taskConfig = try await client.getTaskConfig()
             // Push to ActiveChatStore so ChatViewModels can read it

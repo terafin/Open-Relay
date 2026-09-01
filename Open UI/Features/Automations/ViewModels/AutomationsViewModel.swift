@@ -14,6 +14,8 @@ final class AutomationsViewModel {
 
     /// Controls the create sheet
     var showCreateSheet = false
+    /// When set, the create sheet opens pre-filled with this automation's details (Clone flow)
+    var cloneSource: Automation?
     /// Automation selected for detail/edit
     var selectedAutomation: Automation?
     /// Confirmation delete
@@ -118,9 +120,9 @@ final class AutomationsViewModel {
 
     // MARK: - Create
 
-    func createAutomation(name: String, prompt: String, modelId: String, rrule: String) async -> Automation? {
+    func createAutomation(name: String, prompt: String, modelId: String, rrule: String, channelId: String? = nil) async -> Automation? {
         do {
-            let created = try await apiClient.createAutomation(name: name, prompt: prompt, modelId: modelId, rrule: rrule)
+            let created = try await apiClient.createAutomation(name: name, prompt: prompt, modelId: modelId, rrule: rrule, channelId: channelId)
             automations.insert(created, at: 0)
             Haptics.play(.light)
             return created
@@ -128,6 +130,15 @@ final class AutomationsViewModel {
             errorMessage = "Failed to create: \(error.localizedDescription)"
             return nil
         }
+    }
+
+    // MARK: - Clone
+
+    /// Instead of directly creating a copy, open the create sheet pre-filled so the
+    /// user can adjust the schedule (which may have a past timestamp) before saving.
+    func cloneAutomation(_ automation: Automation) {
+        cloneSource = automation
+        showCreateSheet = true
     }
 
     // MARK: - Update
